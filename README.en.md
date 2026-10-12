@@ -16,6 +16,10 @@ A local-first collector that records *how* you actually model in SolidWorks / Cr
 
 ## What it does
 
+![Collector window](docs/screenshot-main.png)
+
+*The collector while running (Creo attached; the collector's own window is in front here, so stream 2 is "deaf" and records nothing).*
+
 Double-click it, model normally, and it logs a timestamped, multi-stream record to local files:
 
 | Stream | What it captures | Examples |

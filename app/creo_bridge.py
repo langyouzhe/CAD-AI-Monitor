@@ -153,7 +153,7 @@ class CreoBridge:
         self._thread = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
-        self._state = {"connected": False, "trail_file": None,
+        self._state = {"backend": "creo", "connected": False, "trail_file": None,
                        "mapkeys": 0, "last_error": None}
 
     def start(self):

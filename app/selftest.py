@@ -654,6 +654,14 @@ def test_cad_discovery():
                           lambda: False)
     assert b2.prog_ids[0] == "SldWorks.Application.99", b2.prog_ids
 
+    # (7b) 每个后端的状态里必须自带 backend 名（界面上"流1"那行靠它显示谁连上了；
+    #      曾经 Creo 少了这个字段 → 界面显示成 "?✓"）
+    from nx_bridge import NxBridge
+    for bridge, name in ((b, "solidworks"),
+                         (CreoBridge({}, lambda *a: None, lambda: False), "creo"),
+                         (NxBridge({}, lambda *a: None, lambda: False), "nx")):
+        assert bridge.status().get("backend") == name, bridge.status()
+
     # (8) COM 绑定真的存在（不启动 SW 也能证明 ProgID 可用）+ 主程序路径可发现
     #     同样只在"本机装了 SW"时断言（CI 机器上没装）
     if vers:
