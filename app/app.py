@@ -19,7 +19,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from collector_core import resolve_data_dir
+from collector_core import APP_VERSION, resolve_data_dir
 from input_listener import CollectorSession, foreground_window_info, is_modeling_window
 
 REFRESH_MS = 500  # 界面数字每 0.5 秒刷新一次
@@ -160,7 +160,7 @@ class App:
         # 界面上的"当前窗口"是独立小线程探测的（不在采集时也能显示）
         self._fw = (None, None)
 
-        root.title("CAD-AI 采集器 v2")
+        root.title(f"CAD-AI 采集器 v{APP_VERSION}")
         root.geometry("480x315")
         root.resizable(False, False)
 
