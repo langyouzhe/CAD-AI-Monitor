@@ -159,3 +159,10 @@
 | `app\selftest*.py` | 自检与各软件真机联调脚本 |
 | `app\probe_sw_shortcuts*.py` | SW 接口探测工具（开发用） |
 | `app\sw_command_ids.json` | 从 SW 类型库提取的命令 ID 表（约 3600 条） |
+
+## 参与贡献 / 版本历史
+
+- **想帮忙最简单的方式**：用它正常建模一段时间，然后开个 issue 说"**哪个 CAD / 哪个版本 / 哪一路有数据（或没数据）**"——一句话就能把支持矩阵里的一行从"待验证"变成"实测"。
+- 开发环境、代码规矩（不许写死路径和版本、`.bat` 不许写中文、不许提交个人数据）、怎么加一个新 CAD 后端：见 [CONTRIBUTING.md](CONTRIBUTING.md)
+- 每个版本改了什么：[CHANGELOG.md](CHANGELOG.md)
+- 发现 bug 请用 [问题模板](.github/ISSUE_TEMPLATE/bug_report.md)（会让你填 CAD 版本和界面提示原文，这样我才能复现）

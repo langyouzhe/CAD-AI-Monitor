@@ -147,4 +147,18 @@ Tested with Python 3.12 on Windows 11. `build.bat` finds Python by itself (overr
 
 ## License
 
-[MIT](LICENSE) © 2026 langyouzhe. Contributions are welcome — please include your CAD name/version in bug reports so issues can be reproduced.
+[MIT](LICENSE) © 2026 langyouzhe.
+
+## Contributing
+
+The most valuable contribution is not code — it is *"I ran it on my CAD version, here is
+what happened"*. One short issue moves a row of the support matrix from *unverified* to
+*tested*.
+
+- Development setup, the rules we hold to (no hard-coded paths or versions, ASCII-only
+  batch files, never commit personal data) and how to add a new CAD backend:
+  [CONTRIBUTING.md](CONTRIBUTING.md)
+- What changed in each release: [CHANGELOG.md](CHANGELOG.md)
+- Found a bug? Please use the [issue template](.github/ISSUE_TEMPLATE/bug_report.md) — it
+  asks for your CAD version and the status-line text, which is usually what makes a bug
+  reproducible.

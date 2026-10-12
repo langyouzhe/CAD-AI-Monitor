@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Privacy policy / 隐私说明（必读）
+    url: https://github.com/langyouzhe/CAD-AI-Monitor/blob/main/PRIVACY.md
+    about: This tool records keyboard and mouse input. Read what is recorded, where it is stored, and how to delete it. / 本工具会记录键鼠输入：先看清"记什么、存哪、怎么删"。
+  - name: Troubleshooting / 常见问题
+    url: https://github.com/langyouzhe/CAD-AI-Monitor/blob/main/README.md
+    about: "Stream 1 is empty", SmartScreen warnings, Creo trail file location, and other answered questions. / "流1 是空的"、杀软报警、Creo trail 文件在哪等已解答的问题。
