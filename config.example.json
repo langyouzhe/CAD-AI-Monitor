@@ -1,0 +1,118 @@
+{
+  "version": 2,
+  "modeling_apps": [
+    {
+      "exe": "SLDWORKS.exe",
+      "title": "SOLIDWORKS"
+    },
+    {
+      "exe": "sldworks.exe",
+      "title": "SolidWorks"
+    },
+    {
+      "exe": "parametric.exe",
+      "title": "Creo"
+    },
+    {
+      "exe": "xtop.exe",
+      "title": "Creo"
+    },
+    {
+      "exe": "ugraf.exe",
+      "title": "NX"
+    },
+    {
+      "exe": "nx.exe",
+      "title": "NX"
+    },
+    {
+      "exe": "Inventor.exe",
+      "title": "Autodesk Inventor"
+    },
+    {
+      "exe": "acad.exe",
+      "title": "AutoCAD"
+    },
+    {
+      "exe": "SolidEdge.exe",
+      "title": "Solid Edge"
+    },
+    {
+      "exe": "FreeCAD.exe",
+      "title": "FreeCAD"
+    },
+    {
+      "exe": "Fusion360.exe",
+      "title": "Fusion"
+    },
+    {
+      "exe": "IronCAD.exe",
+      "title": "IRONCAD"
+    },
+    {
+      "exe": "catiaintegrat*.exe",
+      "title": "CATIA"
+    }
+  ],
+  "idle_minutes": 5.0,
+  "stream1": {
+    "enabled": true,
+    "backends": [
+      "solidworks",
+      "creo",
+      "nx"
+    ],
+    "backend": "solidworks",
+    "prog_id": "",
+    "allow_launch": false,
+    "poll_interval_s": 1.0
+  },
+  "creo": {
+    "enabled": true,
+    "trail_dirs": [],
+    "config_pro_paths": [],
+    "poll_interval_s": 1.0,
+    "stale_minutes": 10
+  },
+  "nx": {
+    "enabled": true,
+    "syslog_dirs": [],
+    "poll_interval_s": 1.0
+  },
+  "gestures": {
+    "enabled": true,
+    "min_distance_px": 20,
+    "record_polyline": true,
+    "max_points": 60
+  },
+  "ai_eye": {
+    "enabled": false,
+    "provider": "mock",
+    "api_base": "",
+    "api_key": "",
+    "model": "",
+    "max_tokens": 4000,
+    "http_timeout_s": 90,
+    "delay_s": 0.15,
+    "save_images": true,
+    "triggers": {
+      "click_left": true,
+      "click_right": false,
+      "selection_changed": true,
+      "shortcut": true,
+      "bare_letter": true,
+      "gesture": true
+    },
+    "rate_per_min": 60,
+    "max_queue": 20,
+    "dedup_window_s": 0.5
+  },
+  "reconcile": {
+    "enabled": true,
+    "window_ms": 2000,
+    "ignore_middle": true
+  },
+  "debug": {
+    "allow_all_windows": false
+  }
+}
