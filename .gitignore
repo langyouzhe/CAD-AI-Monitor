@@ -33,3 +33,7 @@ desktop.ini
 # ===== 6. 兜底：个人配置（防止手滑把 key 提交上去）=====
 config.json
 config.json.bad
+
+# ===== 7. 本机生成的"命令ID→命令名"表（来自 SolidWorks 类型库，不在仓库分发）=====
+app/sw_command_ids.json
+release/sw_command_ids.json

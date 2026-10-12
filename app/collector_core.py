@@ -325,6 +325,20 @@ class EventStore:
         return [{"seq": r[0], "ts_ms": r[1], "ts_iso": r[2], "source": r[3],
                  "kind": r[4], "detail": json.loads(r[5])} for r in rows]
 
+    def wal_checkpoint(self):
+        """把 WAL 里还没并进主库的内容合并回 events.db（best-effort，绝不抛异常）。
+
+        为什么需要：SQLite 用 WAL 模式时，新数据先写在 events.db-wal 这个旁边的小文件里。
+        如果程序是被强杀的（或者只把 events.db 单独拷走），数据就散在两个文件里。
+        每次停止采集时合并一次，保证"events.db 一个文件 = 完整数据"。
+        """
+        try:
+            with self._lock:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            pass
+
     def close(self):
+        self.wal_checkpoint()
         with self._lock:
             self._conn.close()

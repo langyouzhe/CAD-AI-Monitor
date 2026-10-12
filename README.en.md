@@ -116,7 +116,7 @@ Tested with Python 3.12 on Windows 11. `build.bat` finds Python by itself (overr
 | Stream 1 is empty | The status line now tells you why: "trail file not found" (Creo never ran) or "trail file has not updated for N minutes" (the bridge attached to a dead file — set `creo.trail_dirs` manually). |
 | Creo trail file location | It is in the shortcut's *Start in* folder (e.g. `C:\Users\Public\Documents`). ⚠️ The `trail.txt.1` inside the PTC install directory is a **sample shipped by PTC**, not your work — the bridge no longer mistakes it for the real one. |
 | NX has no data | The NX backend is at probe stage: syslog attach is verified, command parsing awaits real usage data. |
-| Gesture command names are missing | Gesture **direction** is always recorded; the Chinese/English command name needs a command-ID table. A file `data\sw_shortcut_map.json` lets you fill it in. |
+| Gesture command names are missing | Gesture **direction** is always recorded. The command-ID → name table is generated **on first run from your own SolidWorks type library** (`swcommands.tlb`) into `data\sw_command_ids.json` — it is not redistributed with this repository. On SW2022 the type-library numbering does not match the legacy IDs stored in the registry, so names may stay empty; fill them in via `data\sw_shortcut_map.json`, or run `python app\sw_shortcuts.py --generate data` to build the table ahead of time. |
 | I want to delete my data | Close the app and delete the data folder. |
 
 ## Known limitations
@@ -140,7 +140,7 @@ Tested with Python 3.12 on Windows 11. `build.bat` finds Python by itself (overr
 | `app\nx_bridge.py` | stream 1 · NX (syslog parsing, probe) |
 | `app\ai_eye.py` | screenshot → your vision model → event store |
 | `app\reconcile.py` | three-way reconciliation |
-| `app\sw_shortcuts.py` | SolidWorks shortcut/gesture mapping |
+| `app\sw_shortcuts.py` | SolidWorks shortcut/gesture mapping; generates the command-ID table locally from your own SW type library |
 | `app\app.py` | Tkinter GUI and settings dialog |
 | `app\selftest*.py` | self-tests and per-CAD live tests |
 | `config.example.json` | every configuration option, no secrets |

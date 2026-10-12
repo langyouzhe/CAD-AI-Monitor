@@ -38,6 +38,9 @@ rem ---------- 2. check dependencies (we never install anything silently) ------
 if errorlevel 1 goto no_deps
 
 rem ---------- 3. build ----------
+rem NOTE: app\sw_command_ids.json (the command-ID table) is NOT shipped: it is
+rem generated on first run from the user's own SolidWorks type library.
+rem PyInstaller therefore gets no --add-data for it.
 %PY% -m PyInstaller --noconfirm --onefile --noconsole ^
     --name CAD-AI-Collector ^
     --hidden-import pynput.keyboard._win32 ^
@@ -46,14 +49,12 @@ rem ---------- 3. build ----------
     --hidden-import win32com.client ^
     --hidden-import pythoncom ^
     --hidden-import pywintypes ^
-    --add-data "app\sw_command_ids.json;." ^
     app\app.py
 if errorlevel 1 goto build_failed
 
 if not exist dist\CAD-AI-Collector.exe goto build_failed
 if not exist release mkdir release
 copy /Y dist\CAD-AI-Collector.exe release\ >nul
-copy /Y app\sw_command_ids.json release\ >nul
 echo.
 echo Build OK: release\CAD-AI-Collector.exe
 echo Verify with: release\CAD-AI-Collector.exe --selftest   (exit code 0 = healthy)

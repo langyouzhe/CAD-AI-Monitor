@@ -72,6 +72,13 @@ def test_migration():
     cols = [r[1] for r in store._conn.execute("PRAGMA table_info(events)").fetchall()]
     assert "source" in cols, "新表必须有 source 列"
     assert (tmp / "events.v1.backup.db").exists(), "旧库应被备份"
+    # WAL 合并：合并之后主库文件里就该有数据，旁边那个 -wal 不该再堆着东西
+    store.add_event(1, 1, "stream2", "key_down", {"k": "a"}, int(time.time() * 1000))
+    store.wal_checkpoint()
+    wal = Path(str(db) + "-wal")
+    assert (not wal.exists()) or wal.stat().st_size < 4096, (
+        f"合并后 WAL 应该被截断，实际 {wal.stat().st_size if wal.exists() else 0} 字节")
+    assert store.query_session(1), "合并后数据仍然读得到"
     store.close()
     ok("v1 旧数据库自动备份并升级为 v2 结构")
 
@@ -615,11 +622,30 @@ def test_cad_discovery():
     assert scan_trail_files([str(tmp)], max_dirs=1) == [], "目录预算用完应直接返回"
 
     # (6) 笔势注册表路径改成"枚举所有版本"后仍然可用
+    #     （注意：没装 SolidWorks 的机器上注册表里本来就没有笔势设置，所以
+    #      "映射表非空"这个断言只在装了 SW 的机器上要求——否则 CI/别人电脑上会假失败）
     bases = ShortcutMap._registry_gesture_bases()
     assert bases and all(b.startswith(r"Software\SolidWorks") for b in bases), bases
     assert all(b.endswith("Mouse Gestures") for b in bases), bases
     sm = ShortcutMap(Path(tempfile.mkdtemp(prefix="cad-ai-sm-")))
-    assert isinstance(sm.gesture_map, dict) and sm.gesture_map, "笔势映射表不应为空"
+    assert isinstance(sm.gesture_map, dict), sm.gesture_map
+    if vers:  # 本机装了 SW（注册表里有版本键）→ 必须读到笔势
+        assert sm.gesture_map, "装了 SW 却读不到笔势映射"
+
+    # (6b) 命令 ID 表：本机生成逻辑（仓库不分发这张表）
+    from sw_shortcuts import ensure_command_ids, _read_command_ids
+    ids_dir = tmp / "ids"
+    ids_dir.mkdir()
+    (ids_dir / "sw_command_ids.json").write_text('{"32771": "swCommands_Test"}',
+                                                 encoding="utf-8")
+    got = ensure_command_ids(ids_dir)
+    assert got == {32771: "swCommands_Test"}, got
+    assert _read_command_ids(ids_dir / "sw_command_ids.json") == {32771: "swCommands_Test"}
+    assert _read_command_ids(tmp / "not_there.json") == {}      # 缺文件不能抛异常
+    generated = ensure_command_ids(tmp / "fresh_ids")   # 没表时：有 SW 就生成，没有就 None
+    if generated is not None:
+        assert len(generated) > 500, len(generated)
+        assert all(isinstance(v, str) for v in list(generated.values())[:50])
 
     # (7) 桥接对象拿到自动发现出来的 ProgID
     b = SolidWorksBridge({}, lambda *a: None, lambda: False)
@@ -629,10 +655,12 @@ def test_cad_discovery():
     assert b2.prog_ids[0] == "SldWorks.Application.99", b2.prog_ids
 
     # (8) COM 绑定真的存在（不启动 SW 也能证明 ProgID 可用）+ 主程序路径可发现
-    for pid in ids:
-        buf = ctypes.create_string_buffer(16)
-        hr = ctypes.windll.ole32.CLSIDFromProgID(ctypes.c_wchar_p(pid), buf)
-        assert hr == 0, f"ProgID {pid} 无法解析成 CLSID（hr={hr}）"
+    #     同样只在"本机装了 SW"时断言（CI 机器上没装）
+    if vers:
+        for pid in ids:
+            buf = ctypes.create_string_buffer(16)
+            hr = ctypes.windll.ole32.CLSIDFromProgID(ctypes.c_wchar_p(pid), buf)
+            assert hr == 0, f"ProgID {pid} 无法解析成 CLSID（hr={hr}）"
     exe = cad_discovery.sw_exe_path()
     if exe:
         assert Path(exe).name.lower() == "sldworks.exe" and Path(exe).is_file(), exe
@@ -661,7 +689,27 @@ def test_cad_discovery():
     ok("CAD 自动发现正确（不限版本 ProgID / 版本枚举 / 宽目录过滤 / 扫描预算 / 数据目录）")
 
 
+# CI 上能跑的"确定性"子集：不装钩子、不注入输入、不截图、不依赖本机装了哪家 CAD。
+# 用法：python app\selftest.py --ci   （GitHub Actions 就是这么跑的）
+CI_SAFE_TESTS = [
+    test_config_merge,
+    test_migration,
+    test_diff_snapshot,
+    test_window_filter,
+    test_gesture_direction,
+    test_creo_nx_parsers,
+    test_reconcile,
+    test_cad_discovery,
+]
+
+
 if __name__ == "__main__":
+    if "--ci" in sys.argv:
+        print("CI 子集（确定性检查，不需要 CAD / 屏幕 / 真实输入）\n")
+        for _t in CI_SAFE_TESTS:
+            _t()
+        print("\nCI 子集全部通过 ✔")
+        sys.exit(0)
     test_config_merge()
     test_migration()
     test_diff_snapshot()

@@ -28,6 +28,7 @@ python -m pip install -r app\requirements.txt
 
 python app\app.py            :: run from source
 python app\selftest.py       :: 16 self-tests, no CAD needed
+python app\selftest.py --ci  :: the deterministic subset CI runs (no CAD, no input)
 app\build.bat                :: build release\CAD-AI-Collector.exe (finds Python itself)
 ```
 

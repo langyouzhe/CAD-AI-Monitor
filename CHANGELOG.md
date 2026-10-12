@@ -39,6 +39,15 @@ First public pre-release. Windows only, tested against SolidWorks 2022, Creo Par
 - Portability: data directory resolves from `CAD_AI_MONITOR_DATA` → `data\` next to the
   exe (portable) → `Documents\CAD-AI-Monitor\data`.
 - One-click build (`app\build.bat`) that finds Python by itself; pinned dependencies.
+- **The SolidWorks command-ID table is no longer redistributed.** It used to be
+  extracted from `swcommands.tlb` and committed. It is now generated on first run from
+  the type library inside *your own* SolidWorks installation and stored in
+  `data\sw_command_ids.json` (also available as `python app\sw_shortcuts.py --generate`).
+  Nothing is lost if no SolidWorks is installed — gesture direction and the raw command
+  ID are still recorded.
+- **Continuous integration** (`.github/workflows/ci.yml`): compile check, import smoke
+  test and the deterministic self-test subset run on a clean Windows machine with no CAD
+  installed — i.e. exactly the "someone cloned my repo" case.
 
 ### Fixed
 

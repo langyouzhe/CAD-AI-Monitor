@@ -1,0 +1,41 @@
+name: CI
+
+# Runs the deterministic self-test subset on a clean Windows machine that has
+# no CAD installed. That is exactly the "someone cloned my repo" case, so it
+# catches hard-coded paths and version assumptions early.
+# 在一台"什么 CAD 都没装"的干净 Windows 机器上跑确定性自检——正好模拟
+# "别人 clone 了你的仓库"的场景，能提前抓出写死路径/版本的问题。
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    name: Self-tests (Windows, Python 3.12)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r app\requirements.txt
+
+      - name: Compile every source file
+        run: python -m compileall -q app
+
+      - name: Import smoke test
+        run: python -c "import sys; sys.path.insert(0, 'app'); import collector_core, cad_discovery, reconcile, sw_shortcuts, creo_bridge, nx_bridge, ai_eye, input_listener, solidworks_bridge; print('imports OK')"
+
+      - name: Deterministic self-tests
+        run: python app\selftest.py --ci

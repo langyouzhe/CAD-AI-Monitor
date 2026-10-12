@@ -8,7 +8,8 @@ sw_shortcuts.py —— SW 快捷键/笔势映射表（v2.x）
    每个方向存的是"命令 ID"数字（**版本号自动发现**：枚举 HKCU 下所有 SOLIDWORKS 年份键，
    不再写死 2022）；
 3. app\\sw_command_ids.json —— 由 SW 类型库解析出来的"命令ID→命令名"字典
-   （probe 生成，约 3600 条），把注册表里的数字翻译成命令名；
+   （**本机生成、不在仓库里分发**：程序第一次运行时从你电脑上装的 SolidWorks 类型库现场生成，
+   见 ensure_command_ids）；
 4. 内置的常见默认快捷键表（兜底）。
 
 对外两个查询：
@@ -17,6 +18,7 @@ sw_shortcuts.py —— SW 快捷键/笔势映射表（v2.x）
 """
 import json
 import sys
+import threading
 from pathlib import Path
 
 try:
@@ -25,6 +27,112 @@ except ImportError:  # 非 Windows 环境（纯逻辑单测）也能导入
     winreg = None
 
 import cad_discovery
+
+# ---------- 命令 ID 表：本机生成，不在仓库分发 ----------
+#
+# 为什么这样做：注册表里的笔势存的是"命令 ID"数字，要翻成命令名需要一张
+# ID→名字对照表，而这张表来自 SolidWorks 自己的类型库（swcommands.tlb）——
+# 属于厂商软件内容，**再分发有法律争议**，所以：
+#   · 仓库里不放这张表；
+#   · 程序第一次运行时，从**用户自己电脑上装的** SolidWorks 现场生成，存到 data\；
+#   · 没装 SW 或生成失败 → 只是笔势没有中文名（原始 ID 照记），不影响采集。
+#
+# 实测提醒：SW2022 的类型库编号与注册表里存的旧编号对不上，所以本机翻不出名字，
+# 这属于已知限制，不是 bug（见 README「已知限制」）。
+
+COMMAND_IDS_FILE = "sw_command_ids.json"
+_TLB_NAME = "swcommands.tlb"
+_gen_lock = threading.Lock()
+_gen_attempted = False
+
+
+def find_command_tlb():
+    """找本机 SolidWorks 的 swcommands.tlb；找不到返回 None。"""
+    import cad_discovery
+    try:
+        exe = cad_discovery.sw_exe_path()
+    except Exception:
+        exe = None
+    if not exe:
+        return None
+    p = Path(exe).parent / _TLB_NAME
+    return p if p.is_file() else None
+
+
+def build_command_ids_from_tlb(tlb_path):
+    """解析类型库里的枚举常量 → {命令ID: 常量名}。失败返回 {}（绝不抛异常）。"""
+    try:
+        import pythoncom
+    except Exception:
+        return {}
+    out = {}
+    pythoncom.CoInitialize()
+    try:
+        lib = pythoncom.LoadTypeLib(str(tlb_path))
+        for i in range(lib.GetTypeInfoCount()):
+            try:
+                ti = lib.GetTypeInfo(i)
+                ta = ti.GetTypeAttr()
+            except Exception:
+                continue
+            if getattr(ta, "typekind", None) != 0:   # 0 = TKIND_ENUM
+                continue
+            for j in range(ta.cVars):
+                try:
+                    vd = ti.GetVarDesc(j)
+                    names = ti.GetNames(vd.memid)
+                except Exception:
+                    continue
+                name = names[0] if names else None
+                val = getattr(vd, "value", None)
+                if name and isinstance(val, int) and val > 0:   # 负数是占位常量，丢掉
+                    out[int(val)] = name
+    except Exception:
+        return {}
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+    return out
+
+
+def ensure_command_ids(data_dir):
+    """确保有"命令ID→命令名"表：已有就加载；没有就从本机 SW 类型库生成。
+
+    返回 {id: name} 字典；没有 SW 或生成失败返回 None。**只在首次调用时尝试生成。**
+    """
+    global _gen_attempted
+    path = Path(data_dir) / COMMAND_IDS_FILE
+    ids = _read_command_ids(path)
+    if ids:
+        return ids
+    with _gen_lock:
+        if _gen_attempted:
+            return None
+        _gen_attempted = True
+        tlb = find_command_tlb()
+        if not tlb:
+            return None
+        ids = build_command_ids_from_tlb(tlb)
+        if not ids:
+            return None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({str(k): v for k, v in ids.items()},
+                                       ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+        return ids
+
+
+def _read_command_ids(path):
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return {int(k): v for k, v in data.items()}
+    except Exception:
+        return {}
+
 
 # SW 常见默认快捷键（兜底表；用户自定义的以映射文件为准）
 BUILTIN_KEY_MAP = {
@@ -195,3 +303,20 @@ class ShortcutMap:
         if name and name.startswith("swCommands_"):
             name = name[len("swCommands_"):]
         return {"id": gid, "name": name}
+
+
+if __name__ == "__main__":
+    # 手动生成命令 ID 表（想提前建好的话）：
+    #     python app\sw_shortcuts.py --generate [数据目录]
+    _dir = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("data")
+    _tlb = find_command_tlb()
+    print(f"类型库: {_tlb}")
+    if _tlb is None:
+        print("没找到 swcommands.tlb（本机装了 SolidWorks 才会有）")
+        sys.exit(1)
+    _ids = ensure_command_ids(_dir)
+    if not _ids:
+        print("生成失败")
+        sys.exit(1)
+    print(f"生成成功：{len(_ids)} 条 → {Path(_dir) / COMMAND_IDS_FILE}")
+    sys.exit(0)

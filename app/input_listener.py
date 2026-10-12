@@ -168,6 +168,10 @@ class CollectorSession:
             try:
                 from sw_shortcuts import ShortcutMap
                 self.shortcut_map = ShortcutMap(Path(self.store.db_path).parent)
+                if not self.shortcut_map.id2name:
+                    # "命令ID→命令名"表不在仓库里分发（属于厂商软件内容），
+                    # 后台从用户本机装的 SW 类型库现场生成一次
+                    threading.Thread(target=self._warm_command_ids, daemon=True).start()
             except Exception:
                 self.shortcut_map = None
             self._record("meta", "session_start", {"data_dir": str(self.store.db_path.parent)})
@@ -286,6 +290,12 @@ class CollectorSession:
         # 3. 写结束标记并结算
         self._record("meta", "session_stop", {"event_count": self._total()})
         self.store.end_session(self.session_id, self._total())
+        # 4. 把 WAL 合并回主库：这样"events.db 单文件"就是完整数据，
+        #    单独拷走它不会丢最新会话（WAL 模式下的常见坑）
+        try:
+            self.store.wal_checkpoint()
+        except Exception:
+            pass
 
     def stats(self):
         """给界面读的实时数字。"""
@@ -303,6 +313,20 @@ class CollectorSession:
             }
 
     # ---------- 内部：流1 事件落库（v3：选中变化还要喂给 AI 眼） ----------
+
+    def _warm_command_ids(self):
+        """后台生成"命令ID→命令名"表（从本机 SolidWorks 类型库）。
+
+        为什么放后台：解析类型库要零点几秒，不能拖慢"开始采集"。
+        失败（没装 SW / 权限问题）就静默返回——笔势仍会记录原始命令 ID。
+        """
+        try:
+            from sw_shortcuts import ensure_command_ids
+            ids = ensure_command_ids(Path(self.store.db_path).parent)
+            if ids and self.shortcut_map is not None:
+                self.shortcut_map.id2name = ids
+        except Exception:
+            pass
 
     def _on_stream1_event(self, kind, detail):
         """流1 事件统一入口：落库 + （选中变化时）触发 AI 眼。"""
