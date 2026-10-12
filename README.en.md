@@ -36,7 +36,8 @@ Double-click it, model normally, and it logs a timestamped, multi-stream record 
 ## How to use
 
 1. Start SolidWorks (or Creo / NX — whatever is running gets picked up automatically).
-2. Run `release\CAD-AI-Collector.exe` → click **开始采集 (Start)** → model normally → **停止采集 (Stop)**.
+2. **Download and run** `CAD-AI-Collector.exe` from the **Releases** section on the right (no Python needed) → click **开始采集 (Start)** → model normally → **停止采集 (Stop)**.
+   <br>(Want to run from source instead? See the repository layout below; to build the exe yourself, use `app\build.bat`.)
 3. The window shows, live: which backends connected, whether the foreground window counts as a modeling window, and AI Eye statistics.
 
 No paths or versions to configure: the program **auto-discovers** your installation (see below).
