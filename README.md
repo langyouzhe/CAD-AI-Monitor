@@ -155,7 +155,6 @@
 | `app\nx_bridge.py` | 流1·NX：syslog 解析（探测版） |
 | `app\ai_eye.py` | AI 眼：截图→云端→入库 |
 | `app\reconcile.py` | 三方对账：缺票自动标异常 |
-| `app\sw_shortcuts.py` | SW 快捷键/笔势映射（注册表 + 文件） |
 | `app\app.py` | 界面 |
 | `app\selftest*.py` | 自检与各软件真机联调脚本 |
 | `app\probe_sw_shortcuts*.py` | SW 接口探测工具（开发用） |
