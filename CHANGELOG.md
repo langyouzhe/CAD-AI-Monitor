@@ -6,6 +6,23 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/) —
 `0.x` means "early, interfaces may still change".
 
+## [0.1.1] - 2026-10-13
+
+Patch release taken while preparing the first public announcement.
+
+### Fixed
+
+- **The connected Creo backend showed up as `?✓` in the status line.** The Creo
+  bridge's state dict did not carry its `backend` name, so the window fell back to its
+  default label — and the same bug also mangled the hint line into `?：trail 文件…`.
+  Found by inspecting the very screenshot we were taking for the README.
+- Self-test now asserts that every bridge reports its own backend name, so this cannot
+  come back unnoticed.
+
+### Added
+
+- A screenshot of the running window at the top of both READMEs.
+
 ## [0.1.0] - 2026-10-12
 
 First public pre-release. Windows only, tested against SolidWorks 2022, Creo Parametric
