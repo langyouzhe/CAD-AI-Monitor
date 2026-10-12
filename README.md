@@ -4,6 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows-blue)
+[![CI](https://github.com/langyouzhe/CAD-AI-Monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/langyouzhe/CAD-AI-Monitor/actions/workflows/ci.yml)
 
 **English** — A local-first collector that records *how* you actually model in SolidWorks / Creo / NX: software events, your real mouse & keyboard actions, and optional AI vision on top. Built so an AI can later learn **your personal modeling style**. All data stays on your own machine.
 
