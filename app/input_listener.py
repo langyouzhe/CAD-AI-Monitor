@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 input_listener.py —— 采集层：全局键盘/鼠标监听 + 当前窗口跟踪 + 装聋过滤
 
 版本记录：
@@ -9,6 +9,10 @@ input_listener.py —— 采集层：全局键盘/鼠标监听 + 当前窗口跟
      8 方向判定 + 起终点 + 时长 + 途经点（可选）；
   2. AI 眼触发点：点击/快捷键/字母键/笔势发生时，把"光标位置 + 原始事件"
      交给 ai_eye 模块（截图→云端识别），结果以 stream2/ai_eye 事件入库。
+- v4（v0.2.0）：一次 start()→stop() = 一个独立会话文件夹
+  `data\sessions\<yyyy-mm-dd_HHMMSS>\`（images\ + data\events.db + session.json）；
+  空会话停止时删除整个文件夹；停止顺序改为"先停采集源 → 排空 AI 眼队列（上限约 5 秒）
+  → 对账 → 写 session.json → WAL checkpoint 关库"。
 
 本文件不含界面；流1 桥接在 solidworks_bridge.py，AI 眼在 ai_eye.py。
 """
@@ -20,7 +24,7 @@ from pathlib import Path
 
 from pynput import keyboard, mouse
 
-from collector_core import EventStore, now_ms
+from collector_core import BOUNDARY_KINDS, EventStore, now_ms
 
 # 判断"组合键"要看哪些修饰键
 MODIFIER_NAMES = {
@@ -114,18 +118,28 @@ def is_modeling_window(info, modeling_apps, allow_all=False):
 class CollectorSession:
     """一次采集会话：存储 + 流2监听 + 装聋过滤 + 笔势 + 离开/回来 + 流1桥 + AI眼。
 
+    v4 起一次 start()→stop() 就是一个**独立会话文件夹**：
+        data\\sessions\\<开始时刻>\\images\\ + data\\events.db + session.json
+    正常停止且除开始/停止标记外一条事件都没有 → 整个会话文件夹删除（空会话不留痕）。
+
     用法（界面代码就是这么用的）：
         s = CollectorSession(data_dir)
-        s.start()          # 开始记录（重新读一遍配置）
+        s.start()          # 开始记录（新建会话文件夹，重新读一遍配置）
         ...（期间所有合规事件自动落库）...
-        s.stop()           # 停止记录
+        s.stop()           # 停止记录（排空 AI 眼 → 对账 → 写 session.json → 关库）
     """
 
     def __init__(self, data_dir):
         from collector_core import ConfigManager
 
-        self.store = EventStore(Path(data_dir) / "events.db")
-        self.cfg_mgr = ConfigManager(Path(data_dir))
+        self.data_dir = Path(data_dir)   # 数据根目录（config.json、sessions\ 都在这）
+        # 下面三个在 start() 里创建：本次会话文件夹 / 截图目录 / 数据库
+        self.session_dir = None
+        self.db_path = None
+        self.images_dir = None
+        self.store = None                # EventStore（start() 创建，stop() 关闭）
+
+        self.cfg_mgr = ConfigManager(self.data_dir)
         self.cfg = self.cfg_mgr.load()
 
         self.session_id = None
@@ -140,6 +154,10 @@ class CollectorSession:
         self._lock = threading.Lock()
         self._seq = 0
         self._counts = {"stream1": 0, "stream2": 0, "meta": 0}
+        # 空会话判定用：除 session_start / session_stop 外的事件条数
+        # （只看总条数永远删不掉——开始/停止标记本身就把数字撑到 2）
+        self._content_events = 0
+        self._closed = False         # 数据库是否已关闭（关库后迟到的结果直接丢弃）
         self._leave_count = 0
         self._last_event_ts = None   # 最后一条事件的毫秒时间戳（离开检测用）
         self._in_leave = False       # 是否已记过"离开"且还没"回来"
@@ -153,28 +171,56 @@ class CollectorSession:
         self._idle_thread = None
         self._stop_flag = threading.Event()
         self._idle_ms = None  # 离开阈值（毫秒），start() 里按配置算好
+        self._ai_eye_drain = None    # 停止时 AI 眼排空统计
 
     # ---------- 对外：开始 / 停止 ----------
 
     def start(self):
+        from collector_core import (create_session_dir, session_db_path,
+                                    session_images_dir, session_data_dir)
+
         try:
             self.cfg = self.cfg_mgr.load()  # 每次开始都重读设置，改动即时生效
             idle_minutes = float(self.cfg.get("idle_minutes", 5.0))
             self._idle_ms = max(idle_minutes, 0.1) * 60_000
+            # 同一个对象如果被复用（start→stop→start），计数和桥都要归零重来
+            with self._lock:
+                self._seq = 0
+                self._counts = {"stream1": 0, "stream2": 0, "meta": 0}
+                self._content_events = 0
+            self.stream1s = []
+            self.stream1 = None
+            self.ai_eye = None
+            self._leave_count = 0
+            self._in_leave = False
+            self._ai_eye_drain = None
+
+            # v4：先建本次会话文件夹（重名自动 _2/_3），再在里面开库
+            self.session_dir = create_session_dir(self.data_dir)
+            self.images_dir = session_images_dir(self.session_dir)
+            self.images_dir.mkdir(parents=True, exist_ok=True)
+            session_data_dir(self.session_dir).mkdir(parents=True, exist_ok=True)
+            self.db_path = session_db_path(self.session_dir)
+            self.store = EventStore(self.db_path)
+            self._closed = False
+            self._content_events = 0
             self.session_id = self.store.start_session()
             self.started_at = now_ms()
             self._last_event_ts = self.started_at
-            # 快捷键/笔势映射表（本地翻译：d→拉伸 这类）
+            # 快捷键/笔势映射表（本地翻译：d→拉伸 这类）放在数据根目录，跨会话共用
             try:
                 from sw_shortcuts import ShortcutMap
-                self.shortcut_map = ShortcutMap(Path(self.store.db_path).parent)
+                self.shortcut_map = ShortcutMap(self.data_dir)
                 if not self.shortcut_map.id2name:
                     # "命令ID→命令名"表不在仓库里分发（属于厂商软件内容），
                     # 后台从用户本机装的 SW 类型库现场生成一次
                     threading.Thread(target=self._warm_command_ids, daemon=True).start()
             except Exception:
                 self.shortcut_map = None
-            self._record("meta", "session_start", {"data_dir": str(self.store.db_path.parent)})
+            self._record("meta", "session_start", {
+                "data_dir": str(self.data_dir),
+                "session_dir": str(self.session_dir),
+            })
 
             self._kb_listener = keyboard.Listener(
                 on_press=self._on_key_press, on_release=self._on_key_release
@@ -233,6 +279,7 @@ class CollectorSession:
                         self.error = f"流1后端 {backend} 启动失败: {exc}"
 
             # AI 眼：按配置启动（BYOK：没填 key 或 enabled=false 就安静不启动）
+            # v4：截图存本次会话的 images\（不再按日期分层）
             if self.cfg.get("ai_eye", {}).get("enabled", False):
                 try:
                     from ai_eye import AiEye
@@ -243,7 +290,7 @@ class CollectorSession:
                             self._record("stream2", "ai_eye", detail, ts)
                             if self.running else None),
                         is_running=lambda: self.running,
-                        images_dir=Path(self.store.db_path).parent / "images",
+                        images_dir=self.images_dir,
                     )
                     self.ai_eye.start()
                 except Exception as exc:
@@ -252,33 +299,90 @@ class CollectorSession:
             self.running = True
         except Exception as exc:  # 启动失败（少见，一般是系统权限问题）
             self.error = str(exc)
+            self._abort_start()
             raise
 
+    def _abort_start(self):
+        """启动失败时的收尾：停掉已起的线程/桥，关库；还没内容就删掉半截会话文件夹。"""
+        try:
+            if self.ai_eye is not None:
+                try:
+                    self.ai_eye.stop(drain_timeout_s=0)
+                except Exception:
+                    pass
+                self.ai_eye = None
+            for bridge in self.stream1s:
+                try:
+                    bridge.stop()
+                except Exception:
+                    pass
+            self.stream1s = []
+            self.stream1 = None
+            for listener in (self._kb_listener, self._ms_listener):
+                try:
+                    if listener:
+                        listener.stop()
+                except Exception:
+                    pass
+            self._kb_listener = self._ms_listener = None
+            self.running = False
+            if self.store is not None:
+                self.store.close()
+                self.store = None
+            self._closed = True
+            if self.session_dir is not None and self._content_events == 0:
+                from collector_core import delete_session_dir
+                delete_session_dir(self.session_dir)
+                self.session_dir = None
+        except Exception:
+            pass
+
     def stop(self):
+        """停止采集：排空 AI 眼 → 三方对账 → 写 session.json → 关库 → 空会话删除。
+
+        返回本次会话小结（dict）；没在采集时返回 None。字段：
+        session_dir / kept / event_count / counts / duration_s / ai_eye。
+        """
+        from collector_core import (APP_VERSION, SCHEMA_VERSION, STORAGE_VERSION,
+                                    _iso_from_ms, delete_session_dir, now_iso,
+                                    write_session_json)
+
         if not self.running:
-            return
-        self.running = False
+            return None
         self._stop_flag.set()
-        # 1. 停掉所有采集来源
-        if self.ai_eye:
-            try:
-                self.ai_eye.stop()
-            except Exception:
-                pass
+        # 1. 停掉所有采集来源（先断输入，AI 眼队列留到最后排空）
         for bridge in self.stream1s:
             try:
                 bridge.stop()
             except Exception:
                 pass
         if self._kb_listener:
-            self._kb_listener.stop()
+            try:
+                self._kb_listener.stop()
+            except Exception:
+                pass
         if self._ms_listener:
-            self._ms_listener.stop()
+            try:
+                self._ms_listener.stop()
+            except Exception:
+                pass
         if self._win_thread:
             self._win_thread.join(timeout=2)
         if self._idle_thread:
             self._idle_thread.join(timeout=2)
-        # 2. 三方对账（按文档 5.2：缺票自动标异常），结果写成 meta/anomaly
+
+        # 2. 排空 AI 眼队列：等在途云端请求做完（上限 drain_timeout_s，默认 5 秒）
+        #    此时库还开着，识别结果还能归入本次会话（v4 施工注意事项）
+        if self.ai_eye:
+            try:
+                self._ai_eye_drain = self.ai_eye.stop(
+                    drain_timeout_s=float(
+                        self.cfg.get("ai_eye", {}).get("drain_timeout_s", 5.0)))
+            except Exception:
+                self._ai_eye_drain = None
+        self.running = False  # 之后迟到的识别结果不再入库
+
+        # 3. 三方对账（按文档 5.2：缺票自动标异常），结果写成 meta/anomaly
         if self.cfg.get("reconcile", {}).get("enabled", True):
             try:
                 from reconcile import run_on_session
@@ -287,15 +391,78 @@ class CollectorSession:
                     self._last_error_note = f"对账标出 {n} 条异常"
             except Exception:
                 pass
-        # 3. 写结束标记并结算
+
+        # 4. 写结束标记并结算（先把条数算好，session.json / sessions 表都记它）
         self._record("meta", "session_stop", {"event_count": self._total()})
-        self.store.end_session(self.session_id, self._total())
-        # 4. 把 WAL 合并回主库：这样"events.db 单文件"就是完整数据，
-        #    单独拷走它不会丢最新会话（WAL 模式下的常见坑）
+        event_count = self._total()
         try:
-            self.store.wal_checkpoint()
+            self.store.end_session(self.session_id, event_count)
         except Exception:
             pass
+
+        # 5. 写 session.json（标配摘要：不开库就能扫；库坏了也能看）
+        duration_s = round((now_ms() - self.started_at) / 1000.0, 1) if self.started_at else 0.0
+        software = self._software_used()
+        info = {
+            "app_version": APP_VERSION,
+            "storage_version": STORAGE_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "status": "completed",
+            "session_id": self.session_id,
+            "session": self.session_dir.name if self.session_dir else None,
+            "started_at": _iso_from_ms(self.started_at) if self.started_at else None,
+            "stopped_at": now_iso(),
+            "duration_s": duration_s,
+            "software": software,
+            "event_count": event_count,
+            "counts": dict(self._counts),
+            "db": "data/events.db",
+            "images": "images",
+            "ai_eye": self._ai_eye_drain,
+        }
+        try:
+            write_session_json(self.session_dir, info)
+        except Exception as exc:
+            self.error = f"session.json 写入失败: {exc}"
+
+        # 6. 把 WAL 合并回主库再关库：一个会话的 events.db 单文件就是完整数据
+        try:
+            self.store.close()
+        except Exception:
+            pass
+        self._closed = True
+
+        # 7. 空会话不留痕：正常停止且除开始/停止标记外一条事件都没有 → 删整个文件夹
+        kept = self._content_events > 0
+        if not kept and self.session_dir is not None:
+            delete_session_dir(self.session_dir)
+
+        summary = {
+            "session_dir": str(self.session_dir) if self.session_dir else None,
+            "kept": kept,
+            "event_count": event_count,
+            "counts": dict(self._counts),
+            "duration_s": duration_s,
+            "software": software,
+            "ai_eye": self._ai_eye_drain,
+        }
+        return summary
+
+    def _software_used(self):
+        """本次会话"所用软件"：配置启用的后端 + 实际连上的后端（写进 session.json）。"""
+        out = []
+        if self.cfg.get("stream1", {}).get("enabled", True):
+            out = list(self.cfg.get("stream1", {}).get("backends", []))
+        connected = []
+        for bridge in self.stream1s:
+            try:
+                st = bridge.status()
+                name = st.get("backend")
+                if name and st.get("connected") and name not in connected:
+                    connected.append(name)
+            except Exception:
+                pass
+        return {"enabled": out, "connected": connected}
 
     def stats(self):
         """给界面读的实时数字。"""
@@ -306,6 +473,7 @@ class CollectorSession:
                 "leave_count": self._leave_count,
                 "started_at": self.started_at,
                 "session_id": self.session_id,
+                "session_dir": str(self.session_dir) if self.session_dir else None,
                 "current_window": self._current_window,
                 "in_leave": self._in_leave,
                 "stream1_status": [b.status() for b in self.stream1s] if self.stream1s else None,
@@ -319,10 +487,11 @@ class CollectorSession:
 
         为什么放后台：解析类型库要零点几秒，不能拖慢"开始采集"。
         失败（没装 SW / 权限问题）就静默返回——笔势仍会记录原始命令 ID。
+        表放**数据根目录**（跨会话共用），不是某个会话文件夹里。
         """
         try:
             from sw_shortcuts import ensure_command_ids
-            ids = ensure_command_ids(Path(self.store.db_path).parent)
+            ids = ensure_command_ids(self.data_dir)
             if ids and self.shortcut_map is not None:
                 self.shortcut_map.id2name = ids
         except Exception:
@@ -352,19 +521,28 @@ class CollectorSession:
         """统一入口：补"回来"标记 → 写事件 → 更新离开检测时钟。
 
         返回事件的时间戳（毫秒），AI 眼需要用它把识别结果挂回原事件。
+        库关闭之后（停采之后）迟到的结果直接丢弃，不抛异常。
         """
         ts = ts or now_ms()
         with self._lock:
-            # 之前记过"离开"，现在有活动了 → 先补一条"回来"
-            if self._in_leave:
+            if self._closed or self.store is None:
+                return ts
+            try:
+                # 之前记过"离开"，现在有活动了 → 先补一条"回来"
+                if self._in_leave:
+                    self._seq += 1
+                    self.store.add_event(self.session_id, self._seq, "meta", "return",
+                                         {"since_ts": self._last_event_ts}, ts)
+                    self._counts["meta"] += 1
+                    self._in_leave = False
                 self._seq += 1
-                self.store.add_event(self.session_id, self._seq, "meta", "return",
-                                     {"since_ts": self._last_event_ts}, ts)
-                self._counts["meta"] += 1
-                self._in_leave = False
-            self._seq += 1
-            self.store.add_event(self.session_id, self._seq, source, kind, detail, ts)
+                self.store.add_event(self.session_id, self._seq, source, kind, detail, ts)
+            except Exception:
+                return ts
             self._counts[source if source in self._counts else "meta"] += 1
+            # v4 空会话判定：开始/停止标记是每次会话必有的"边界"，不算用户数据
+            if kind not in BOUNDARY_KINDS:
+                self._content_events += 1
             # 注意：AI 眼结果挂的是原事件的时间戳（可能早于当前），
             # 时钟只能前进不能倒退，否则离开检测会被回拨干扰。
             if self._last_event_ts is None or ts > self._last_event_ts:

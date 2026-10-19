@@ -10,7 +10,7 @@ A local-first collector that records *how* you actually model in SolidWorks / Cr
 
 > ⚖️ **Trademark notice** — This is an independent personal project. It is **not affiliated with, authorized, sponsored or endorsed by** Dassault Systèmes, PTC, Siemens or their affiliates. SolidWorks®, Creo® and NX™ are trademarks of their respective owners and are named here **only to describe compatibility**. The tool reads data that these applications themselves produce or expose locally (COM interface, Creo trail files, NX syslog). It does not modify, crack or bypass any software licensing.
 
-> 🏷️ **Versioning** — Public releases follow semantic versioning; the current release is **v0.1.1** (`0.x` = early, interfaces may still change). Labels such as *v2* / *v3* that appear in code comments or the Chinese documentation are **internal development generations**, not release versions.
+> 🏷️ **Versioning** — Public releases follow semantic versioning; the current release is **v0.2.0** (`0.x` = early, interfaces may still change). Labels such as *v2* / *v3* / *v4* that appear in code comments or the Chinese documentation are **internal development generations** (2nd architecture → 3rd adds vision → 4th adds per-session storage), not release versions.
 
 > 🔒 **Privacy** — This program is technically a keyboard/mouse recorder, so please read [PRIVACY.md](PRIVACY.md) before using it. Short version: it only records while a CAD window is in front, everything is stored locally, and the only network activity is the optional AI Eye that you enable with your own API key.
 
@@ -26,7 +26,7 @@ Double-click it, model normally, and it logs a timestamped, multi-stream record 
 |---|---|---|
 | **Stream 1 (hands)** | Model changes reported by the CAD's own interface: which document is open, **which face/edge/feature you selected**, feature-tree additions/removals, executed commands | SolidWorks: `selectionChanged`; Creo: `creo_trail` (menu/command log); NX: `nx_syslog` (probe stage) |
 | **Stream 2 (eyes)** | What you physically did inside the CAD window: clicks, keys, shortcuts, **gestures (button drags)** | `key_down` (local lookup turns `s` into a command name), `gesture` (direction + command id) |
-| **Stream 2 · AI Eye** | On a trigger, screenshots the **whole CAD window** and asks your vision model what happened; the answer is stored on the original event's timestamp | `data\images\` keeps the PNGs |
+| **Stream 2 · AI Eye** | On a trigger, screenshots the **whole CAD window** and asks your vision model what happened; the answer is stored on the original event's timestamp | `data\sessions\<start time>\images\` keeps the JPEGs |
 | **Reconciliation** | On stop, cross-checks action ↔ stream-1 effect ↔ vision result and flags missing evidence as `meta/anomaly` | `stream2_no_effect`, `stream1_orphan`, `visual_missing`, `visual_failed` |
 | **meta** | Session start/stop and leave/return markers (no idle events) | idle threshold is configurable |
 
@@ -34,7 +34,7 @@ Double-click it, model normally, and it logs a timestamped, multi-stream record 
 
 1. **Deaf mode (装聋)** — input is only recorded while a configured CAD window is in the foreground. Switch to a browser and it stops immediately.
 2. **No pause events** — every row carries a timestamp; idle time is just the gap between rows.
-3. **Screenshots are your call** — with `save_images: true` (default) PNGs are kept in `data\images\<date>\`; set it to `false` and screenshots never touch the disk.
+3. **Screenshots are your call** — with `save_images: true` (default) JPEGs are kept in the current session's `images\` folder (`data\sessions\<start time>\images\`); set it to `false` and screenshots never touch the disk.
 4. **Local only** — no server, no account, no telemetry. The single optional network call is the AI Eye (see [PRIVACY.md](PRIVACY.md)).
 
 ## How to use
@@ -48,9 +48,36 @@ No paths or versions to configure: the program **auto-discovers** your installat
 
 ## Where your data lives
 
-First match wins: `CAD_AI_MONITOR_DATA` env var → `data\` next to the exe (portable) → `Documents\CAD-AI-Monitor\data\`.
+Resolution order (first match wins): `CAD_AI_MONITOR_DATA` env var → `data\` next to the exe (portable) → `Documents\CAD-AI-Monitor\data\`.
 
-Inside: `events.db` (SQLite; tables `sessions` and `events` with `ts_ms | ts_iso | source | kind | detail`) and optionally `images\<YYYYMMDD>\`.
+**Since v0.2.0, one collection run = one folder** (nothing is mixed into a shared file anymore):
+
+```
+data\sessions\2026-10-19_122035\   start-time folder name (local time; _2/_3 on collision)
+├─ images\                         AI Eye screenshots of this session (JPEG, flat)
+├─ data\events.db                  SQLite; tables `sessions` and `events` (ts_ms | ts_iso | source | kind | detail)
+└─ session.json                    summary: app version, start/stop time, CAD software, event count, schema version
+```
+
+- **Empty sessions leave no trace** — a normal stop that recorded nothing except the start/stop markers deletes the whole folder.
+- **Interrupted sessions are kept** — on the next launch, sessions with an empty `sessions.stopped_at` are preserved, WAL-checkpointed and marked `"status": "aborted"` in `session.json`.
+- **Cross-session access** — walk `data\sessions\*\data\events.db`, or use the helper: `python app\collector_core.py` (add `--json` / `--events` for machine-readable output).
+- **Single instance** — launching a second copy shows “已在采集中” (already collecting) and exits, so two processes never write the same data.
+- The bottom bar shows the current session folder; **打开文件夹 (Open folder)** opens it.
+
+### Upgrading from v0.1.x
+
+> Close the old collector before running the new version (so the old process is not still holding the old database).
+
+On the first launch of v0.2.0, the old data is **moved, never deleted**:
+
+```
+data\legacy\events_legacy.db     old data\events.db
+data\legacy\images\...           old data\images\ (same relative layout)
+data\legacy\migration.log        migration log
+```
+
+The absolute screenshot paths stored inside the old database are rewritten to the new location, so old screenshots keep working. The migration is idempotent (never overwrites an existing archive), rolls back to the untouched state on failure, and logs the outcome. To roll back: close the app, rename `data\legacy\events_legacy.db` back to `data\events.db` and `data\legacy\images\` back to `data\images\`.
 
 ## Supported versions (auto-discovery, no hard-coded versions)
 
@@ -85,7 +112,8 @@ What auto-discovery looks at:
 | `ai_eye.enabled` | `false` | master switch for the AI Eye |
 | `ai_eye.provider` | `mock` | `mock` / `zhipu` / `qwen` / `doubao` / `custom` |
 | `ai_eye.api_key` | empty | **your** API key (BYOK) |
-| `ai_eye.save_images` | `true` | keep screenshots locally |
+| `ai_eye.save_images` | `true` | keep screenshots in the session's `images\` folder |
+| `ai_eye.drain_timeout_s` | `5.0` | on stop, how long to wait for in-flight cloud requests before closing the database |
 | `ai_eye.triggers` | left click, shortcut, letter key, gesture on | what fires a screenshot |
 | `ai_eye.rate_per_min` | `60` | screenshot rate limit |
 | `reconcile.window_ms` | `2000` | how long after an action a stream-1 event still counts as its effect |
@@ -106,7 +134,7 @@ cd CAD-AI-Monitor
 python -m pip install -r app\requirements.txt
 
 python app\app.py          :: run from source
-python app\selftest.py     :: 16 self-tests, no CAD required
+python app\selftest.py     :: 22 self-tests, no CAD required
 app\build.bat              :: build release\CAD-AI-Collector.exe
 release\CAD-AI-Collector.exe --selftest   :: exit code 0 = healthy
 ```
@@ -123,7 +151,9 @@ Tested with Python 3.12 on Windows 11. `build.bat` finds Python by itself (overr
 | Creo trail file location | It is in the shortcut's *Start in* folder (e.g. `C:\Users\Public\Documents`). ⚠️ The `trail.txt.1` inside the PTC install directory is a **sample shipped by PTC**, not your work — the bridge no longer mistakes it for the real one. |
 | NX has no data | The NX backend is at probe stage: syslog attach is verified, command parsing awaits real usage data. |
 | Gesture command names are missing | Gesture **direction** is always recorded. The command-ID → name table is generated **on first run from your own SolidWorks type library** (`swcommands.tlb`) into `data\sw_command_ids.json` — it is not redistributed with this repository. On SW2022 the type-library numbering does not match the legacy IDs stored in the registry, so names may stay empty; fill them in via `data\sw_shortcut_map.json`, or run `python app\sw_shortcuts.py --generate data` to build the table ahead of time. |
-| I want to delete my data | Close the app and delete the data folder. |
+| I want to delete my data | Close the app and delete the data folder, or just one `data\sessions\<start time>\` session folder. `data\legacy\` holds archived pre-v0.2.0 data — check twice before deleting it. |
+| Where did my old (v0.1.x) data go? | It was moved — never deleted — to `data\legacy\` on the first v0.2.0 launch (`events_legacy.db` + `data\legacy\images\`, paths rewritten so screenshots still open). See “Upgrading from v0.1.x” above. |
+| A second launch says “已在采集中” | Only one instance may write data at a time. Switch to the already-open window instead of launching another copy. |
 
 ## Known limitations
 
@@ -132,13 +162,14 @@ Tested with Python 3.12 on Windows 11. `build.bat` finds Python by itself (overr
 3. **Reconciliation is advisory.** `stream2_no_effect` may just be a view-only click; nothing is deleted automatically.
 4. **AI Eye quality depends on your model.** Verified live with DeepSeek (`deepseek-flash`) returning schema-conform JSON in ~3–6 s.
 5. **No code signature.** Expect SmartScreen warnings; each release lists a SHA-256 checksum so you can verify the download.
-6. **Data is not de-identified.** Do not publish a collected `data\` folder without reviewing it.
+6. **Data is not de-identified.** Do not publish a collected `data\` folder (or session folder) without reviewing it.
+7. **v0.2.0 changed the storage layout.** If you wrote scripts that read the single `data\events.db`, walk `data\sessions\*\data\events.db` instead (or use `python app\collector_core.py --json`). Pre-v0.2.0 data lives in `data\legacy\`.
 
 ## Repository layout
 
 | Path | Responsibility |
 |---|---|
-| `app\collector_core.py` | config + local storage (SQLite) |
+| `app\collector_core.py` | config + per-session storage (v4) + legacy archive / crash recovery + cross-session summary CLI |
 | `app\cad_discovery.py` | CAD auto-discovery (ProgIDs, registry versions, trail/syslog folders, CAD app list) |
 | `app\input_listener.py` | stream 2: hooks, deaf mode, gestures, leave/return, AI Eye triggers |
 | `app\solidworks_bridge.py` | stream 1 · SolidWorks (COM snapshots + diff) |

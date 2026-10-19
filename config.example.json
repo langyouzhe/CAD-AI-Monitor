@@ -95,6 +95,7 @@
     "http_timeout_s": 90,
     "delay_s": 0.15,
     "save_images": true,
+    "drain_timeout_s": 5.0,
     "triggers": {
       "click_left": true,
       "click_right": false,

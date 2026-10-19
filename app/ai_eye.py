@@ -9,9 +9,12 @@ ai_eye.py —— AI 眼模块（v2.x，实现文档「v3 规格」的视觉维�
    多模态模型，返回一句话结论（点了什么 / 界面状态 / 有无报错），按时间戳
    与流1 事件配对落库；
 3. BYOK：不填 key → 视觉功能整体关闭（零成本）；
-4. 存储：图存本地 data\\images\\（save_images 默认 true，攒"特征视觉图鉴"）；
-   不勾 save_images = 截图只在内存里转一圈，磁盘上从头到尾不留图；
-5. 原则：视觉不做数值判断（见文档 5.2）。
+4. 存储：图存**本次会话**的 images\\（v4：data\\sessions\\<开始时刻>\\images\\，不再按日期分层；
+   save_images 默认 true，攒"特征视觉图鉴"）；不勾 save_images = 截图只在内存里转一圈，
+   磁盘上从头到尾不留图；
+5. 停止时**先排空队列**（等在途云端请求做完，上限 drain_timeout_s 默认 5 秒）再关库，
+   保证识别结果归入本次会话（v4 施工注意事项）；
+6. 原则：视觉不做数值判断（见文档 5.2）。
 """
 import base64
 import io
@@ -20,7 +23,6 @@ import queue
 import threading
 import time
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
 # 服务商预设（OpenAI 兼容接口；api_base 留空时按 provider 取预设）
@@ -105,6 +107,8 @@ class AiEye:
         # 思考就把额度吃光 → 正式回答为空。所以默认给足，并允许设置里调。
         self.max_tokens = int(self.cfg.get("max_tokens", 4000))
         self.http_timeout_s = float(self.cfg.get("http_timeout_s", 90))
+        # 停止采集时等在途云端请求做完的上限（秒）：排空队列后再关库
+        self.drain_timeout_s = float(self.cfg.get("drain_timeout_s", 5.0))
         self.images_dir = Path(images_dir)
         self.on_result = on_result      # (detail, ts) -> None
         self.is_running = is_running    # () -> bool
@@ -113,6 +117,8 @@ class AiEye:
         self._thread = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
+        self._accepting = False         # 是否还接收新触发（stop 后不再接）
+        self._in_flight = False         # 是否正在处理一张图（截图/云端识别）
         self._state = {"provider": self.provider, "queued": 0, "ok": 0, "fail": 0,
                        "skipped": 0, "last_result": None, "msg": ""}
         self._last_trigger_ms = 0       # 连点合并用
@@ -122,23 +128,57 @@ class AiEye:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self._accepting = True
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
-    def stop(self):
-        self._stop.set()
+    def stop(self, drain_timeout_s=None):
+        """停止识别线程：先把已排队的触发做完（在途云端请求等最多 drain_timeout_s 秒）。
+
+        为什么先排空：停止时如果直接杀线程，正在云端识别的结果就丢了，
+        "这次会话里点了什么"会缺票。排空之后再让采集器关库，结果才能归入本次会话。
+        返回排空统计（drained_s / pending / in_flight），方便界面上说明"还有几张没等回来"。
+        """
+        self._accepting = False         # 不再接新触发，但队列里已排的继续做完
+        timeout = (self.drain_timeout_s if drain_timeout_s is None
+                   else float(drain_timeout_s))
+        started = time.monotonic()
+        quiet = 0
+        while (time.monotonic() - started) < max(0.0, timeout):
+            with self._lock:
+                busy = self._in_flight
+            if self._queue.empty() and not busy:
+                # 连查两次"确实空了"再收手：避免正好卡在
+                # "工作线程已取出任务、还没来得及记 in_flight"的那一下
+                quiet += 1
+                if quiet >= 2:
+                    break
+            else:
+                quiet = 0
+            time.sleep(0.02)
+        drained_s = time.monotonic() - started
+        self._stop.set()                # 队列空了（或等超时）→ 让线程收尾退出
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=1.5)
+        with self._lock:
+            pending = self._queue.qsize()
+            if pending:
+                self._state["skipped"] += pending
+            info = {"drained_s": round(drained_s, 2), "pending": pending,
+                    "in_flight": bool(self._in_flight)}
+        return info
 
     def status(self):
         with self._lock:
-            return dict(self._state)
+            st = dict(self._state)
+            st["queued"] = self._queue.qsize()   # 实时排队数（含正在处理的那张）
+            return st
 
     # ---------- 触发决策 ----------
 
     def trigger(self, kind, detail, ts_ms, pos=None):
         """采集器每记一条相关事件都会喊一次 trigger，这里决定截不截。"""
-        if not self.is_running():
+        if not self._accepting or not self.is_running():
             return
         # 1) 事件类型 → 触发开关
         if kind == "click":
@@ -200,6 +240,9 @@ class AiEye:
                 job = self._queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            with self._lock:
+                self._in_flight = True
+                self._state["queued"] = self._queue.qsize()
             image_path = None
             try:
                 time.sleep(max(0.0, self.delay_s))  # 等菜单/对话框弹出来
@@ -215,6 +258,8 @@ class AiEye:
                                   or job["detail"].get("event_type")),
                 "provider": self.provider,
                 "image": image_path,
+                # 相对会话文件夹的路径（v4）：整包拷走会话文件夹也不会断链
+                "image_rel": self._image_rel(image_path),
                 "result": result,
             }
             with self._lock:
@@ -225,12 +270,27 @@ class AiEye:
                     self._state["fail"] += 1
                     self._state["msg"] = str(result.get("error", ""))[:80]
             # 结果挂回原事件时间戳（对齐），由采集器落库
-            self.on_result(detail, job["ts"])
+            try:
+                self.on_result(detail, job["ts"])
+            finally:
+                with self._lock:
+                    self._in_flight = False
+                    self._state["queued"] = self._queue.qsize()
+
+    def _image_rel(self, image_path):
+        """截图相对会话文件夹的路径（images\\xxx.jpg）；没存图返回 None。"""
+        if not image_path:
+            return None
+        try:
+            return Path(image_path).relative_to(self.images_dir.parent).as_posix()
+        except ValueError:
+            return None
 
     def _capture(self, job):
         """截"整个建模窗口" → 返回 (图片路径或 None, base64)。
 
-        勾了"保存截图"（keep_images=true）：写到本地 images\\<日期>\\ 并返回路径；
+        勾了"保存截图"（keep_images=true）：v4 写到**本次会话**的 images\\ 下
+        （data\\sessions\\<开始时刻>\\images\\xxx.jpg，不再按日期分层）并返回路径；
         没勾：只留内存里的 base64，磁盘从头到尾不落图。
         """
         from PIL import ImageGrab
@@ -243,10 +303,12 @@ class AiEye:
         img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
         path = None
         if self.keep_images:
-            day = datetime.now().strftime("%Y%m%d")
-            folder = self.images_dir / day
-            folder.mkdir(parents=True, exist_ok=True)
-            path = folder / f"{job['ts']}_{job['kind']}.jpg"
+            self.images_dir.mkdir(parents=True, exist_ok=True)
+            path = self.images_dir / f"{job['ts']}_{job['kind']}.jpg"
+            n = 2
+            while path.exists():   # 同一毫秒同类别再触发一次时别覆盖前一张
+                path = self.images_dir / f"{job['ts']}_{job['kind']}_{n}.jpg"
+                n += 1
             path.write_bytes(buf.getvalue())
         return (str(path) if path else None, img_b64)
 

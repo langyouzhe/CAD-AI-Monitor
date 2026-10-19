@@ -1,7 +1,7 @@
 # Privacy Policy
 
 **Applies to:** CAD-AI Collector (this repository) — a Windows desktop tool that records how you model in SolidWorks / Creo / NX.
-**Last updated:** 2026-10-12
+**Last updated:** 2026-10-19 (v0.2.0 — per-session storage folders)
 
 > Short version: this tool is, technically, a **keyboard + mouse recorder**. It is designed so that it only records while a CAD window is in front, everything is stored in **local files**, and the **only** network activity is an *optional* AI-vision feature that you enable with **your own** API key.
 
@@ -11,8 +11,8 @@
 |---|---|
 | Does it upload my data anywhere? | **No.** There is no server, no account, no telemetry. The only network call is the optional AI Eye, which you must enable yourself. |
 | Does it record my keyboard everywhere? | **No.** It is "deaf" (装聋, *zhuāng lóng*) unless one of the CAD windows you configured is in the foreground. |
-| Where is the data? | Local files only: one SQLite file + an optional screenshots folder. |
-| Can I delete everything? | Close the app and delete the data folder. Nothing is left behind elsewhere. |
+| Where is the data? | Local files only: one folder per collection session (`data\sessions\<start time>\`) plus an optional screenshots folder inside it; older data is moved to `data\legacy\`. |
+| Can I delete everything? | Close the app and delete the data folder (or a single session folder). Nothing is left behind elsewhere. |
 | Is my API key safe? | It is stored **in plain text** inside your local `config.json`. Protect that file; never commit it, never share it. |
 
 ## 1. What is recorded (only while a CAD window is in front)
@@ -42,14 +42,26 @@ Resolution order (first match wins):
 2. `data\` next to the executable (portable mode)
 3. `Documents\CAD-AI-Monitor\data\` (default)
 
-Inside it: `events.db` (SQLite, WAL mode) and, if `save_images` is on, `images\<YYYYMMDD>\*.png`.
-There are no hidden uploads, no analytics endpoints, and no third-party SDKs bundled for tracking.
+Since **v0.2.0**, each *start → stop* collection run gets its own folder (nothing is mixed into one shared database anymore):
+
+```
+data\sessions\2026-10-19_122035\     one collection session (name = local start time; _2/_3 on collision)
+├─ images\                           AI Eye screenshots of this session (JPEG)
+├─ data\events.db                    SQLite (WAL mode), tables `sessions` and `events`
+└─ session.json                      summary: app version, start/stop time, CAD software, event count, schema version
+```
+
+- **Empty sessions are deleted**: if a normal stop recorded nothing except the start/stop markers, the whole session folder is removed.
+- **Interrupted sessions are kept**: on the next start, folders whose `sessions.stopped_at` is empty are preserved, checkpointed and marked `"status": "aborted"` in `session.json` — data is never silently discarded.
+- **Older versions' data** (`data\events.db` + `data\images\`) is moved — never deleted — to `data\legacy\` on first launch (`events_legacy.db`, with screenshot paths rewritten so they keep working). A migration log is written to `data\legacy\migration.log`.
+- A small helper lists the sessions without opening the GUI: `python app\collector_core.py` (it walks `data\sessions\*\data\events.db`).
+- There are no hidden uploads, no analytics endpoints, and no third-party SDKs bundled for tracking.
 
 ## 4. The only network activity: the optional AI Eye
 
 - **Off by default.** The default provider is `mock`, which performs no network call and returns a fake result so you can try the workflow for free.
 - To use it you register with a vision-model provider (Zhipu, Alibaba Bailian, Volcano Engine, or any OpenAI-compatible endpoint), copy **your own** API key into the settings, and switch `ai_eye.enabled` to `true`.
-- When it runs, it sends: one PNG screenshot of the foreground CAD window + a short fixed instruction prompt. It sends nothing else — no event database, no file paths, no user identity.
+- When it runs, it sends: one JPEG screenshot of the foreground CAD window + a short fixed instruction prompt. It sends nothing else — no event database, no file paths, no user identity.
 - Costs are billed to **your** account by **your** provider.
 - The response text is stored locally next to the triggering event, so you can audit exactly what the model saw and answered.
 - If you never fill in an API key, the program makes **zero** network connections.
@@ -59,13 +71,13 @@ There are no hidden uploads, no analytics endpoints, and no third-party SDKs bun
 Screenshots and event logs can contain **company IP**: part geometry, dimensions, feature names, project names, customer data, sometimes a colleague's screen if the CAD window spans displays.
 
 - Do **not** enable the AI Eye on confidential work unless your employer allows sending those images to a third-party model provider.
-- Do **not** publish or upload a collected `data\` folder without reviewing and sanitizing it first.
+- Do **not** publish or upload a collected session folder (`data\sessions\<start time>\`) or the archived `data\legacy\` without reviewing and sanitizing it first.
 - If you contribute data to any community dataset, you are responsible for having the right to share it.
 
 ## 6. Retention and deletion
 
 - The program keeps nothing after you close it except the files in the data folder.
-- Data lives until **you** delete it. To erase everything: close the app, then delete the data folder (see §3).
+- Data lives until **you** delete it. To erase everything: close the app, then delete the data folder (see §3). To erase a single collection run, delete its `data\sessions\<start time>\` folder. Sessions that recorded nothing are removed automatically; interrupted sessions are kept and marked `aborted` so you can decide.
 - Uninstalling = deleting the executable and the data folder. The program does not install services, drivers, or scheduled tasks.
 
 ## 7. Why antivirus tools may flag it

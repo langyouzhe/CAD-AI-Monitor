@@ -6,6 +6,62 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/) —
 `0.x` means "early, interfaces may still change".
 
+## [0.2.0] - 2026-10-19
+
+Session storage v4: every *start → stop* is now its own folder, so repeated collections
+never mix into one shared database.
+
+### Added
+
+- **Per-session storage (v4)** — each collection run creates
+  `data\sessions\<yyyy-mm-dd_HHMMSS>\` (local start time; `_2`, `_3` on collision)
+  containing:
+  - `images\` — this session's AI Eye screenshots, flat (no more per-date subfolders);
+  - `data\events.db` — this session's SQLite database (same `sessions` + `events` tables);
+  - `session.json` — a summary readable **without opening the database**: app version,
+    start/stop time, CAD software (enabled + actually connected), event count,
+    schema version and status.
+- **Empty sessions leave no trace** — a normal stop that recorded nothing except the
+  start/stop markers deletes the whole session folder.
+- **Crash recovery** — on startup, unfinished sessions (empty `sessions.stopped_at`) are
+  kept, WAL-checkpointed and marked `"status": "aborted"` in `session.json`; only truly
+  empty leftovers (no database, no files at all) are removed.
+- **Legacy data archive** — on first launch the old `data\events.db` + `data\images\` are
+  moved (never deleted) to `data\legacy\`: the database becomes `events_legacy.db`, the
+  images keep their relative layout under `legacy\images\`, and the absolute screenshot
+  paths inside the database are rewritten so they keep working. The migration is
+  idempotent, never overwrites an existing archive, rolls back to the untouched state on
+  failure and logs its result to `data\legacy\migration.log`.
+- **Single-instance lock** — a second launch shows “已在采集中” and exits, so two processes
+  can never write the same data folder at once.
+- **AI Eye queue drain on stop** — in-flight cloud requests are awaited (default 5 s cap,
+  `ai_eye.drain_timeout_s`) before the database is closed, so recognition results land in
+  the session that triggered them.
+- **Cross-session helper** — `python app\collector_core.py [--json|--events]` walks
+  `data\sessions\*\data\events.db` and prints a per-session summary; `session_summaries()`
+  reads `session.json` first, so it still works when a database is damaged.
+- New self-tests: session naming/collisions, empty-session removal, crash recovery,
+  legacy archive (idempotency + failure rollback), `session.json` fields, cross-session
+  traversal, single-instance lock and AI Eye drain.
+
+### Changed
+
+- Version bump to **0.2.0**. The window title shows the session folder name while
+  collecting, and the bottom bar shows the current session folder.
+- Screenshots are plain JPEGs inside the session's `images\`; event details now also carry
+  `image_rel` (path relative to the session folder), so one session folder is a complete,
+  movable data package.
+- Stop sequence: stop collectors → drain AI Eye → reconcile → write `session.json` →
+  WAL checkpoint and close the database → delete the folder if the session was empty.
+- `README.md` / `README.en.md` / `PRIVACY.md` / `config.example.json` document the new
+  layout, the upgrade path and how to find (or roll back) old data.
+
+### Fixed
+
+- `data\images\` no longer grows as one pile shared by every session, and a single session
+  can be archived or shared without breaking its screenshot links.
+- Cleaned up a stale import in `ai_eye.py` after screenshots moved to per-session folders.
+
 ## [0.1.1] - 2026-10-13
 
 Patch release taken while preparing the first public announcement.

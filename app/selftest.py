@@ -17,10 +17,14 @@ import ctypes
 import ctypes.wintypes as wt
 import json
 import os
+import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 
 # 强制 UTF-8 输出，避免老式控制台（GBK 编码）打印中文/符号报错
@@ -29,14 +33,27 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from collector_core import (  # noqa: E402
-    DEFAULT_CONFIG, ConfigManager, EventStore,
+    DEFAULT_CONFIG, ConfigManager, EventStore, SingleInstanceLock,
+    create_session_dir, iter_all_events, iter_session_databases,
+    migrate_legacy_data, read_session_json, recover_sessions,
+    session_db_path, session_meta_path, session_summaries, sessions_root,
+    write_session_json,
 )
 from input_listener import CollectorSession, is_modeling_window  # noqa: E402
 from solidworks_bridge import diff_snapshot  # noqa: E402
 
+APP_DIR = str(Path(__file__).resolve().parent)
+
 
 def ok(msg):
     print("OK  " + msg)
+
+
+class FakeKey:
+    """可哈希的合成按键对象（types.SimpleNamespace 不可哈希，放进 _pressed 集合会抛异常）。"""
+
+    def __init__(self, char=None):
+        self.char = char
 
 
 # ---------- 1. 配置合并 ----------
@@ -216,18 +233,16 @@ def test_end_to_end_stream2():
 # ---------- 6.5 离开/回来（确定性验证，不受真人输入干扰） ----------
 
 def test_leave_return():
-    import types
     tmp = tempfile.mkdtemp(prefix="cad-ai-lr-")
     session = _mk_session(tmp, idle_minutes=0.1)  # 阈值 6 秒
     session.start()
     time.sleep(0.4)
-    key_a = types.SimpleNamespace(char="a")  # 合成按键对象
-    session._on_key_press(key_a)              # 第一次操作
+    session._on_key_press(FakeKey("a"))       # 第一次操作
     # 把"最后操作时间"拨回 10 秒前，直接调用离开检测
     with session._lock:
         session._last_event_ts = session._last_event_ts - 10_000
     session._maybe_leave()
-    session._on_key_press(types.SimpleNamespace(char="s"))  # 回来后的第一次操作
+    session._on_key_press(FakeKey("s"))       # 回来后的第一次操作
     time.sleep(0.3)
     session.stop()
 
@@ -238,11 +253,12 @@ def test_leave_return():
     assert len(leave) == 1, f"应记一条 leave: {kinds}"
     assert len(returns) == 1, f"下一次活动前应补 return: {kinds}"
     assert returns[0]["seq"] > leave[0]["seq"], "return 应在 leave 之后"
+    assert any(k == "key_down" for _, k in kinds), "合成按键应真的入库（不是被静默丢掉）"
     # 连续两次 _maybe_leave 不应重复记 leave
     session2 = _mk_session(tempfile.mkdtemp(prefix="cad-ai-lr2-"), idle_minutes=0.1)
     session2.start()
     time.sleep(0.3)
-    session2._on_key_press(types.SimpleNamespace(char="a"))
+    session2._on_key_press(FakeKey("a"))
     with session2._lock:
         session2._last_event_ts = session2._last_event_ts - 10_000
     session2._maybe_leave()
@@ -341,6 +357,23 @@ def test_creo_nx_parsers():
 
 # ---------- 9. AI 眼（假模式）单元测试：时间戳对齐（确定性，不受真人输入干扰） ----------
 
+def _fake_capture(eye):
+    """给 AiEye 换一个"假截图"（测试不依赖真实屏幕/锁屏状态）。
+
+    真实的截图裁剪（DPI/多显示器）由 test_capture_dpi_box 单独验证；
+    本函数只保证触发规则、时间戳对齐、保存开关这些逻辑可确定性验证。
+    """
+    def capture(job):
+        path = None
+        if eye.keep_images:
+            eye.images_dir.mkdir(parents=True, exist_ok=True)
+            path = eye.images_dir / f"{job['ts']}_{job['kind']}.jpg"
+            path.write_bytes(b"fake-jpeg-bytes")
+        return (str(path) if path else None,
+                "ZmFrZS1qcGVnLWJ5dGVz")  # base64("fake-jpeg-bytes")
+    return capture
+
+
 def test_ai_eye_unit():
     import shutil
     from ai_eye import AiEye
@@ -359,6 +392,7 @@ def test_ai_eye_unit():
                                   "gesture": True, "selection_changed": False}},
                 on_result=on_result, is_running=lambda: True,
                 images_dir=_P(tmp) / "images")
+    eye._capture = _fake_capture(eye)   # 不碰真实屏幕（锁屏也能测）
     eye.start()
     fake_ts = 1700000000000
     eye.trigger("click", {"button": "left"}, fake_ts, (100, 100))
@@ -376,9 +410,11 @@ def test_ai_eye_unit():
     assert ts == fake_ts, "AI 眼结果必须挂回原事件时间戳（对齐）"
     assert detail["result"]["ok"] is True
     assert detail["annotates"] == "click"
-    # 勾了"保存截图"：图应落在本地 images 目录
+    # 勾了"保存截图"：图应落在本地 images 目录（v4：直接放，不再按日期分层）
     img = detail.get("image")
     assert img and _P(img).exists(), "截图应保存到本地 images 目录"
+    assert _P(img).parent == _P(tmp) / "images", f"截图应直接放 images\\ 下: {img}"
+    assert detail.get("image_rel", "").startswith("images/"), detail.get("image_rel")
 
     # 不勾"保存截图"：磁盘上不应留下任何图（单一开关，无冲突）
     results2 = []
@@ -387,6 +423,7 @@ def test_ai_eye_unit():
                       "triggers": {"click_left": True}},
                  on_result=lambda d, t: results2.append((d, t)),
                  is_running=lambda: True, images_dir=_P(tmp) / "images2")
+    eye2._capture = _fake_capture(eye2)
     eye2.start()
     eye2.trigger("click", {"button": "left"}, fake_ts + 100, (100, 100))
     deadline = time.monotonic() + 8
@@ -471,7 +508,15 @@ def test_capture_dpi_box():
     import win32gui
     scale = _screen_scale()
     assert scale >= 1.0, f"缩放系数应 >= 1.0，实际 {scale}"
-    img = ImageGrab.grab(all_screens=True)     # 所有显示器
+    try:
+        img = ImageGrab.grab(all_screens=True)     # 所有显示器
+    except Exception as exc:
+        # 工作站锁屏 / 没有可交互桌面时抓不到屏：属于环境限制，不算代码失败。
+        # 解锁后重跑本项即可覆盖"真实截图裁剪"（--ci 里本来就不跑这项）。
+        assert AiEye._foreground_window_box((0, 0)) is None
+        print(f"  SKIP 真实截屏验证（当前桌面不可截图：{exc}）；"
+              f"解锁屏幕后重跑可覆盖此项")
+        return
     box = AiEye._foreground_window_box(img.size)
     if box is not None:
         l, t, r, b = box
@@ -506,6 +551,8 @@ def test_gesture_and_ai_eye():
         }, f, ensure_ascii=False, indent=2)
     session = CollectorSession(tmp)
     session.start()
+    if session.ai_eye is not None:
+        session.ai_eye._capture = _fake_capture(session.ai_eye)  # 不依赖真实屏幕
     time.sleep(0.6)
     btn_right = types.SimpleNamespace(name="right")
     btn_left = types.SimpleNamespace(name="left")
@@ -697,6 +744,367 @@ def test_cad_discovery():
     ok("CAD 自动发现正确（不限版本 ProgID / 版本枚举 / 宽目录过滤 / 扫描预算 / 数据目录）")
 
 
+# ======================================================================
+# v4 会话存储（v0.2.0）：会话文件夹 / 空会话 / 崩溃会话 / 旧库归档 / 遍历分析
+# ======================================================================
+
+# 测试专用"建模软件"名单：保证真人输入一律装聋（否则测试会被前台窗口污染）
+TEST_ONLY_APPS = [{"exe": "__cad_ai_no_such_app__.exe",
+                   "title": "__CAD_AI_NO_SUCH_WINDOW__"}]
+
+
+def _mk_session_v4(tmp, stream1_enabled=False, idle_minutes=10.0):
+    """建一个 v4 会话对象：只记测试合成的事件，不受真人输入干扰。"""
+    with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "version": 2,
+            "idle_minutes": idle_minutes,
+            "modeling_apps": TEST_ONLY_APPS,
+            "debug": {"allow_all_windows": False},
+            "stream1": {"enabled": stream1_enabled, "poll_interval_s": 0.5},
+        }, f, ensure_ascii=False, indent=2)
+    return CollectorSession(tmp)
+
+
+def test_v4_session_naming():
+    """会话文件夹命名：<yyyy-mm-dd_HHMMSS>，重名自动 _2、_3。"""
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-v4name-"))
+    when = datetime(2026, 10, 19, 12, 20, 35)
+    a = create_session_dir(tmp, when=when)
+    b = create_session_dir(tmp, when=when)
+    c = create_session_dir(tmp, when=when)
+    assert a.name == "2026-10-19_122035", a.name
+    assert b.name == "2026-10-19_122035_2", b.name
+    assert c.name == "2026-10-19_122035_3", c.name
+    assert a.parent == b.parent == c.parent == sessions_root(tmp)
+    for p in (a, b, c):
+        assert re.match(r"^\d{4}-\d{2}-\d{2}_\d{6}(_\d+)?$", p.name), p.name
+    shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("v4 会话命名正确（年月日_时分秒 + 重名自动 _2/_3）")
+
+
+def test_v4_session_folder_and_json():
+    """两次「开始→停止」→ 两个独立会话文件夹，各含 images\\、data\\events.db、session.json。"""
+    tmp = tempfile.mkdtemp(prefix="cad-ai-v4layout-")
+    dirs = []
+    for _ in range(2):
+        session = _mk_session_v4(tmp)
+        session.start()
+        time.sleep(0.05)
+        session._record("stream2", "click", {"button": "left", "action": "press",
+                                             "x": 10, "y": 20})
+        session._record("stream2", "click", {"button": "left", "action": "release",
+                                             "x": 10, "y": 20})
+        summary = session.stop()
+        assert summary and summary["kept"] is True, summary
+        session_dir = Path(summary["session_dir"])
+        dirs.append(session_dir)
+        # 停止后库已关闭，但读取仍必须可用（只读重开）
+        events = session.store.query_session(session.session_id)
+        assert len(events) == summary["event_count"] >= 2
+        assert events[0]["kind"] == "session_start"
+        assert events[-1]["kind"] == "session_stop"
+
+    assert len(set(d.name for d in dirs)) == 2, "两次采集必须落在两个不同文件夹"
+    expected_keys = ("app_version", "storage_version", "schema_version", "status",
+                     "started_at", "stopped_at", "software", "event_count",
+                     "counts", "session_id", "db", "images")
+    for session_dir in dirs:
+        assert session_dir.parent == sessions_root(tmp)
+        assert (session_dir / "images").is_dir(), "会话里必须有 images\\"
+        db = session_dir / "data" / "events.db"
+        assert db.is_file(), "会话里必须有 data\\events.db"
+        assert not (Path(tmp) / "events.db").exists(), "v4 不应再写根目录单库"
+        meta = read_session_json(session_dir)
+        assert meta, "会话里必须有 session.json"
+        for key in expected_keys:
+            assert key in meta, (key, meta)
+        assert meta["app_version"] == "0.2.0", meta["app_version"]
+        assert meta["schema_version"] == 2
+        assert meta["storage_version"] == 4
+        assert meta["status"] == "completed"
+        assert meta["stopped_at"], "正常停止必须有停止时间"
+        assert meta["counts"]["stream2"] == 2, meta["counts"]
+        assert isinstance(meta["software"], dict)
+        assert "enabled" in meta["software"] and "connected" in meta["software"]
+        # sessions 表里必须有这条记录、且已结束（表结构不变）
+        conn = sqlite3.connect(str(db))
+        try:
+            row = conn.execute(
+                "SELECT started_at, stopped_at, event_count FROM sessions").fetchone()
+        finally:
+            conn.close()
+        assert row and row[1], row
+        assert row[2] == meta["event_count"] == summary["event_count"], (row, meta)
+    shutil.rmtree(tmp, ignore_errors=True)
+    ok("v4 会话文件夹结构正确（images/ + data/events.db + session.json，两次采集互相独立）")
+
+
+def test_v4_empty_session_removed():
+    """空会话不留痕：正常停止且除开始/停止标记外 0 事件 → 整个文件夹删除。"""
+    tmp = tempfile.mkdtemp(prefix="cad-ai-v4empty-")
+    session = _mk_session_v4(tmp)   # 测试专用假建模名单 → 真人输入全部装聋
+    session.start()
+    time.sleep(0.3)
+    summary = session.stop()
+    assert summary is not None, "stop 应返回小结"
+    assert summary["event_count"] == 2, summary   # 只有 session_start / session_stop
+    assert summary["kept"] is False
+    assert not Path(summary["session_dir"]).exists(), "空会话必须整个删除"
+    assert list((Path(tmp) / "sessions").iterdir()) == [], "sessions\\ 下不该留空会话文件夹"
+    shutil.rmtree(tmp, ignore_errors=True)
+    ok("v4 空会话不留痕（0 事件正常停止 → 会话文件夹整个删除）")
+
+
+def test_v4_crash_recovery():
+    """崩溃半截会话：一律保留、WAL checkpoint、session.json 标 aborted；只清无 db 空目录。"""
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-v4crash-"))
+    root = sessions_root(tmp)
+    root.mkdir(parents=True)
+
+    # 1) 真·崩溃会话：子进程写库后 os._exit（不写 stopped_at、不 checkpoint）
+    crash_dir = root / "2026-10-19_100000"
+    (crash_dir / "data").mkdir(parents=True)
+    (crash_dir / "images").mkdir()
+    crash_db = crash_dir / "data" / "events.db"
+    code = (
+        "import os, sys, time\n"
+        "sys.path.insert(0, %r)\n"
+        "from collector_core import EventStore\n"
+        "st = EventStore(%r)\n"
+        "sid = st.start_session()\n"
+        "st.add_event(sid, 1, 'stream2', 'click', "
+        "{'button': 'left', 'action': 'press'}, int(time.time() * 1000))\n"
+        "os._exit(3)\n"
+    ) % (APP_DIR, str(crash_db))
+    proc = subprocess.run([sys.executable, "-c", code], timeout=60)
+    assert proc.returncode == 3, f"模拟崩溃的子进程退出码不对: {proc.returncode}"
+    wal = Path(str(crash_db) + "-wal")
+    assert wal.exists(), "模拟崩溃应留下 -wal（测试前提）"
+
+    # 2) 崩溃留下的空残骸：没有 db、没有任何文件 → 启动清理
+    empty_dir = root / "2026-10-19_100001"
+    (empty_dir / "data").mkdir(parents=True)
+    (empty_dir / "images").mkdir()
+
+    # 3) 正常结束的会话 A：没有 session.json → 启动时补一份 completed
+    done_dir = root / "2026-10-19_090000"
+    (done_dir / "data").mkdir(parents=True)
+    (done_dir / "images").mkdir()
+    store = EventStore(session_db_path(done_dir))
+    sid = store.start_session()
+    store.add_event(sid, 1, "stream2", "key_down", {"char": "a"},
+                    int(time.time() * 1000))
+    store.end_session(sid, 1)
+    store.close()
+    # 4) 正常结束的会话 B：已有 session.json → 不许被覆盖
+    done2_dir = root / "2026-10-19_090500"
+    (done2_dir / "data").mkdir(parents=True)
+    (done2_dir / "images").mkdir()
+    store2 = EventStore(session_db_path(done2_dir))
+    sid2 = store2.start_session()
+    store2.end_session(sid2, 0)
+    store2.close()
+    write_session_json(done2_dir, {"status": "completed", "marker": "keep-me"})
+
+    result = recover_sessions(tmp)
+    assert str(crash_dir) in result["aborted"], result
+    assert not empty_dir.exists(), "无 db 的空目录应被清理"
+    assert done_dir.is_dir() and done2_dir.is_dir(), "正常会话不能被误删"
+
+    # 崩溃会话：保留 + 摘要标 aborted + stopped_at 仍为空（表结构不变）
+    meta = read_session_json(crash_dir)
+    assert meta and meta["status"] == "aborted", meta
+    assert meta["stopped_at"] is None
+    assert meta["event_count"] >= 1 and meta["recovered_at"], meta
+    assert "强杀" in meta.get("note", "") or "崩溃" in meta.get("note", "")
+    conn = sqlite3.connect(str(crash_db))
+    try:
+        row = conn.execute("SELECT stopped_at FROM sessions").fetchone()
+    finally:
+        conn.close()
+    assert row and row[0] is None, "aborted 会话的 stopped_at 必须保持空"
+    assert (not wal.exists()) or wal.stat().st_size < 4096, "崩溃会话应已 WAL checkpoint"
+
+    # 正常会话：摘要丢了就补、已有的不覆盖
+    assert read_session_json(done_dir)["status"] == "completed"
+    kept = read_session_json(done2_dir)
+    assert kept.get("marker") == "keep-me", "已有 session.json 不应被启动扫描覆盖"
+    shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("v4 崩溃会话保留并标 aborted（WAL checkpoint + 摘要恢复），只清无 db 空目录")
+
+
+def test_v4_legacy_archive():
+    """旧数据整包归档：events.db→legacy\\events_legacy.db、images→legacy\\images，不断链、可幂等。"""
+    base = Path(tempfile.mkdtemp(prefix="cad-ai-v4legacy-"))
+    data = base / "data"
+    data.mkdir()
+    img_dir = data / "images" / "20261012"
+    img_dir.mkdir(parents=True)
+    img = img_dir / "1791814096825_click.jpg"
+    img.write_bytes(b"fake-jpeg-bytes")
+    store = EventStore(data / "events.db")
+    sid = store.start_session()
+    store.add_event(sid, 1, "stream2", "ai_eye",
+                    {"annotates": "click", "image": str(img)}, 1791814096825)
+    store.end_session(sid, 1)
+    store.close()
+
+    info = migrate_legacy_data(data)
+    assert info and info["ok"] is True, info
+    assert not (data / "events.db").exists(), "旧库应已搬走"
+    legacy_db = data / "legacy" / "events_legacy.db"
+    assert legacy_db.is_file(), "旧库应改名成 legacy\\events_legacy.db"
+    assert not (data / "images").exists(), "旧图应已搬走"
+    new_img = data / "legacy" / "images" / "20261012" / "1791814096825_click.jpg"
+    assert new_img.is_file(), "旧图应保持相对位置放在 legacy\\images 下"
+    # 库内图片路径已改写 → 逐条都能点开（不断链）
+    conn = sqlite3.connect(str(legacy_db))
+    try:
+        detail = json.loads(conn.execute(
+            "SELECT detail FROM events WHERE kind = 'ai_eye'").fetchone()[0])
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+    finally:
+        conn.close()
+    assert Path(detail["image"]) == new_img, detail["image"]
+    assert Path(detail["image"]).is_file(), "库内图片路径必须真实存在（不能断链）"
+    assert info["rewritten"] == 1
+    # 迁移日志 + 幂等（再启动一次不会重复搬）
+    assert (data / "legacy" / "migration.log").is_file(), "迁移结果应有日志"
+    assert migrate_legacy_data(data) is None, "无旧数据时应直接返回 None（幂等）"
+    # 重名不覆盖：又出现一份旧库 → events_legacy_2.db，已有归档不动
+    store2 = EventStore(data / "events.db")
+    sid2 = store2.start_session()
+    store2.end_session(sid2, 0)
+    store2.close()
+    info2 = migrate_legacy_data(data)
+    assert info2 and info2["ok"] is True
+    assert Path(info2["db"]).name == "events_legacy_2.db", info2["db"]
+    assert legacy_db.is_file(), "已迁移的数据不能被覆盖"
+
+    # 迁移失败必须回退成"原样不动"（把 legacy 占成一个文件 → 建目录失败）
+    data2 = base / "data_broken"
+    data2.mkdir()
+    store3 = EventStore(data2 / "events.db")
+    sid3 = store3.start_session()
+    store3.end_session(sid3, 0)
+    store3.close()
+    (data2 / "legacy").write_text("i am a file, not a dir", encoding="utf-8")
+    bad = migrate_legacy_data(data2)
+    assert bad and bad["ok"] is False, bad
+    assert (data2 / "events.db").is_file(), "迁移失败时旧库必须原样不动"
+    shutil.rmtree(str(base), ignore_errors=True)
+    ok("v4 旧数据整包归档正确（改名/图保持相对位置/路径不断链/幂等/失败回退）")
+
+
+def test_v4_iterate_all_sessions():
+    """跨会话分析：遍历 data\\sessions\\*\\data\\events.db（不再假设单库）。"""
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-v4iter-"))
+    root = sessions_root(tmp)
+    root.mkdir(parents=True)
+    names = ["2026-10-19_100000", "2026-10-19_110000"]
+    for i, name in enumerate(names):
+        d = root / name
+        (d / "data").mkdir(parents=True)
+        (d / "images").mkdir()
+        st = EventStore(session_db_path(d))
+        sid = st.start_session()
+        st.add_event(sid, 1, "stream2", "key_down", {"char": "a"},
+                     1700000000000 + i * 1000)
+        st.end_session(sid, 1)
+        st.close()
+        write_session_json(d, {"app_version": "0.2.0", "schema_version": 2,
+                               "status": "completed", "started_at": "x",
+                               "stopped_at": "y", "event_count": 1,
+                               "software": {"enabled": [], "connected": []}})
+    # 数据根目录没有单库，分析也必须能找到两个会话
+    assert not (tmp / "events.db").exists()
+    dbs = list(iter_session_databases(tmp))
+    assert len(dbs) == 2, dbs
+    events = list(iter_all_events(tmp))
+    assert len(events) == 2
+    assert [e["session"] for e in events] == names
+    assert all(e["session_dir"] for e in events)
+    summaries = session_summaries(tmp)
+    assert len(summaries) == 2
+    assert all(s["status"] == "completed" and s["event_count"] == 1 for s in summaries)
+    # 摘要丢了：不开 session.json 也能从库补出来
+    (root / names[1] / "session.json").unlink()
+    summaries2 = session_summaries(tmp)
+    assert summaries2[1]["event_count"] == 1
+    assert summaries2[1]["status"] == "completed"
+    shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("v4 跨会话分析正确（遍历 sessions\\*\\data\\events.db + 摘要可回填）")
+
+
+def test_v4_single_instance_lock():
+    """单实例锁：第二个实例拿不到锁（含另一个进程），释放后可重新拿。"""
+    name = "Local\\CAD-AI-Collector-selftest-%d" % os.getpid()
+    first = SingleInstanceLock(name)
+    assert first.acquire() is True, "第一个实例应拿到锁"
+    second = SingleInstanceLock(name)
+    assert second.acquire() is False, "同一进程里第二个实例也必须拿不到锁"
+    # 真·另一个进程也拿不到（禁止两个实例同时写数据）
+    if not getattr(sys, "frozen", False):
+        code = ("import sys; sys.path.insert(0, %r); "
+                "from collector_core import SingleInstanceLock; "
+                "l = SingleInstanceLock(%r); "
+                "print('acquired' if l.acquire() else 'blocked')"
+                % (APP_DIR, name))
+        out = subprocess.run([sys.executable, "-c", code],
+                             capture_output=True, text=True, timeout=30)
+        assert out.stdout.strip() == "blocked", (out.stdout, out.stderr)
+    first.release()
+    third = SingleInstanceLock(name)
+    assert third.acquire() is True, "释放后应能重新拿到锁"
+    third.release()
+    from collector_core import DEFAULT_INSTANCE_NAME
+    assert DEFAULT_INSTANCE_NAME.startswith("Local\\"), DEFAULT_INSTANCE_NAME
+    ok("v4 单实例锁正确（第二个实例被拒绝，跨进程有效）")
+
+
+def test_v4_ai_eye_drain():
+    """停止时排空 AI 眼队列（上限 drain_timeout_s），结果不丢；超时有上限。"""
+    from ai_eye import AiEye
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-v4drain-"))
+    results = []
+
+    def make_eye(images):
+        eye = AiEye(cfg={"provider": "mock", "delay_s": 0.01,
+                         "dedup_window_s": 0, "max_queue": 10,
+                         "rate_per_min": 999, "save_images": False,
+                         "drain_timeout_s": 5,
+                         "triggers": {"click_left": True}},
+                    on_result=lambda d, t: results.append((d, t)),
+                    is_running=lambda: True, images_dir=images)
+        eye._capture = _fake_capture(eye)   # 不碰真实屏幕
+        return eye
+
+    eye = make_eye(tmp / "images")
+    eye.start()
+    for i in range(3):
+        eye.trigger("click", {"button": "left"}, 1700000000000 + i * 1000, (10, 10))
+    info = eye.stop()          # 默认排水：把已排队的 3 张都做完
+    assert len(results) == 3, f"停止前应排空队列，实际只收到 {len(results)} 条"
+    assert info["pending"] == 0, info
+    # 停止之后不再接收新触发（避免写进已结束的会话）
+    eye.trigger("click", {"button": "left"}, 1700000000999, (10, 10))
+    time.sleep(0.2)
+    assert len(results) == 3, "停止后不应再接收新截图任务"
+
+    # 排空上限：在途云端请求等太久时，stop 不能无限等（drain 只等 timeout 秒）
+    slow = make_eye(tmp / "images_slow")
+    slow._recognize = lambda job, b64: (time.sleep(2.0),
+                                        {"ok": True, "answer": {}})[1]
+    slow.start()
+    slow.trigger("click", {"button": "left"}, 1700000000000, (10, 10))
+    time.sleep(0.15)           # 让它进入"在途"
+    info2 = slow.stop(drain_timeout_s=0.2)
+    assert info2["drained_s"] < 1.5, f"排空上限没生效: {info2}"
+    shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("v4 停止时 AI 眼队列排空正确（结果不丢 + 在途请求有上限）")
+
+
 # CI 上能跑的"确定性"子集：不装钩子、不注入输入、不截图、不依赖本机装了哪家 CAD。
 # 用法：python app\selftest.py --ci   （GitHub Actions 就是这么跑的）
 CI_SAFE_TESTS = [
@@ -708,6 +1116,12 @@ CI_SAFE_TESTS = [
     test_creo_nx_parsers,
     test_reconcile,
     test_cad_discovery,
+    # v4：纯文件/纯逻辑，不开钩子不截图
+    test_v4_session_naming,
+    test_v4_crash_recovery,
+    test_v4_legacy_archive,
+    test_v4_iterate_all_sessions,
+    test_v4_single_instance_lock,
 ]
 
 
@@ -732,5 +1146,14 @@ if __name__ == "__main__":
     test_reconcile()
     test_gesture_and_ai_eye()
     test_cad_discovery()
+    # v4 会话存储（v0.2.0）用例
+    test_v4_session_naming()
+    test_v4_session_folder_and_json()
+    test_v4_empty_session_removed()
+    test_v4_crash_recovery()
+    test_v4_legacy_archive()
+    test_v4_iterate_all_sessions()
+    test_v4_single_instance_lock()
+    test_v4_ai_eye_drain()
     print("\n全部自检通过 ✔")
     sys.exit(0)
