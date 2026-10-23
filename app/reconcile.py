@@ -29,7 +29,7 @@ STREAM1_EFFECT_KINDS = {
     "featureAdded", "featureRemoved", "featureChanged",
     "selectionChanged", "documentActivated",
     "creo_trail", "creo_command",
-    "nx_syslog",
+    "nx_journal", "nx_syslog",   # nx_syslog 仅兼容 v0.2.x 旧数据
 }
 
 
@@ -160,14 +160,38 @@ def pair_events(events, window_ms=2000, ignore_middle=True,
     return anomalies
 
 
+def stream1_available(session):
+    """本次会话的流1 有没有活过来（任意后端 connected）。
+
+    v0.2.x 的对账是"每个动作往后找一条流1 效果"，一旦流1 没数据源，
+    所有动作都会被判成 stream2_no_effect（2026-10-23 实测 158 条全误报）。
+    所以对账前先问一句：尺子（流1）在不在。
+    """
+    try:
+        statuses = session.stats().get("stream1_status") or []
+    except Exception:
+        return False
+    return any(bool(st.get("connected")) for st in statuses)
+
+
 def run_on_session(session, cfg):
     """对一次采集会话跑对账，把异常写成 meta/anomaly 事件落库。
 
     返回异常条数。在 stop() 里、写 session_stop 之前调用。
+
+    流1 不可用时**跳过对账**，只写一条 meta/stream1_unavailable 汇总——
+    否则会产出"所有动作都缺效果"的假异常（问题清单 P1-3）。
     """
     events = session.store.query_session(session.session_id)
     rc = cfg.get("reconcile", {})
     ai_cfg = cfg.get("ai_eye", {})
+    if not stream1_available(session):
+        session._record("meta", "stream1_unavailable", {
+            "reason": "本次会话流1 无数据源（后端未连接），已跳过对账，避免误报异常",
+            "hint": "检查采集器界面『流1』：NX 需先录制 journal 或配置 nx.journal_path；"
+                    "SW/Creo 需先打开对应软件",
+        })
+        return 0
     visual_enabled = bool(ai_cfg.get("enabled")) and ai_cfg.get("provider") != "mock"
     anomalies = pair_events(
         events,

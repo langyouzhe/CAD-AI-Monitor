@@ -348,11 +348,37 @@ def test_creo_nx_parsers():
     assert maps == {}
     ok("Creo trail 行解析正确（命令事件/UI 交互保留，鼠标轨迹噪音丢弃）")
 
-    from nx_bridge import parse_syslog_line
-    ev = parse_syslog_line("12345 2025/01/02 10:30:45  USER  Entered command: FIT")
-    assert ev and ev["ts"] == "2025/01/02 10:30:45"
-    assert parse_syslog_line("没有时间戳的一行") is None
-    ok("NX syslog 行解析正确")
+    # ---- NX journal（2026-10-23 换数据源：syslog → journal）----
+    from journal_parser import (find_latest_journal, parse_journal,
+                                parse_journal_line, read_journal_text)
+    fx = (Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+          / "journal_sample.cs")
+    assert fx.is_file(), f"缺少测试样本: {fx}"
+    parsed = parse_journal(fx)
+    menus = [e for e in parsed if e["type"] == "menu"]
+    apis = [e for e in parsed if e["type"] == "api"]
+    assert len(menus) >= 10, f"menu 事件只有 {len(menus)} 条（应 ≥10）"
+    assert len(apis) >= 3, f"api 事件只有 {len(apis)} 条（应 ≥3）"
+    assert any("Extrude" in e["menu"] for e in menus), menus
+    raw_menu_lines = [ln for ln in read_journal_text(fx).splitlines() if "Menu:" in ln]
+    assert len(raw_menu_lines) == len(menus), (len(raw_menu_lines), len(menus))
+    for raw, ev in zip(raw_menu_lines, menus):
+        assert raw.split("Menu:", 1)[1].strip() == ev["menu"], (raw, ev)
+    assert parse_journal_line("var x = 1;") is None
+    assert parse_journal_line("//   Menu: Insert->Sketch")["menu"] == "Insert->Sketch"
+    # 编码：UTF-16（真实 journal）与 UTF-8 都能读
+    jtmp = tempfile.mkdtemp(prefix="cad-ai-journal-")
+    u8 = Path(jtmp) / "j8.py"
+    u8.write_text("// Menu: Insert->Curve->Line\n"
+                  "NXOpen.Session.GetSession()\n", encoding="utf-8")
+    assert [e["type"] for e in parse_journal(u8)] == ["menu", "api"]
+    # 内容过滤：普通 .py 不能被误当成 journal
+    other = Path(jtmp) / "unrelated.py"
+    other.write_text("print('hello')\n", encoding="utf-8")
+    assert find_latest_journal([jtmp]).name == "j8.py"
+    assert find_latest_journal([], explicit=str(fx)) == fx
+    shutil.rmtree(str(jtmp), ignore_errors=True)
+    ok("NX journal 解析正确（menu/API/UTF-16与UTF-8/内容过滤）")
 
 
 # ---------- 9. AI 眼（假模式）单元测试：时间戳对齐（确定性，不受真人输入干扰） ----------
@@ -848,7 +874,10 @@ def test_v4_empty_session_removed():
     time.sleep(0.3)
     summary = session.stop()
     assert summary is not None, "stop 应返回小结"
-    assert summary["event_count"] == 2, summary   # 只有 session_start / session_stop
+    # 空会话里可能还有一条 meta/stream1_unavailable 对账汇总（流1 没数据源的诊断），
+    # 但它属于 meta，不算用户数据 → 仍判空会话
+    assert summary["counts"]["stream1"] == 0, summary
+    assert summary["counts"]["stream2"] == 0, summary
     assert summary["kept"] is False
     assert not Path(summary["session_dir"]).exists(), "空会话必须整个删除"
     assert list((Path(tmp) / "sessions").iterdir()) == [], "sessions\\ 下不该留空会话文件夹"
@@ -1105,6 +1134,84 @@ def test_v4_ai_eye_drain():
     ok("v4 停止时 AI 眼队列排空正确（结果不丢 + 在途请求有上限）")
 
 
+def test_reconcile_stream1_guard():
+    """P1-3（2026-10-23）：流1 不可用时跳过对账，只写一条 meta/stream1_unavailable。
+
+    以前流1 全空时，每个动作都找不到"效果"，158 条 anomaly 全是误报。
+    """
+    from reconcile import run_on_session, stream1_available
+
+    class _FakeStore:
+        def query_session(self, sid):
+            return []
+
+    class _FakeSession:
+        def __init__(self, connected):
+            self.session_id = 1
+            self.store = _FakeStore()
+            self.recorded = []
+            self._connected = connected
+
+        def stats(self):
+            return {"stream1_status": [{"backend": "nx", "connected": self._connected}]}
+
+        def _record(self, source, kind, detail):
+            self.recorded.append((source, kind, detail))
+            return 0
+
+    cfg = {"reconcile": {"enabled": True}}
+    s = _FakeSession(False)
+    assert stream1_available(s) is False
+    assert run_on_session(s, cfg) == 0
+    assert [k for _, k, _ in s.recorded] == ["stream1_unavailable"], s.recorded
+
+    s2 = _FakeSession(True)
+    assert stream1_available(s2) is True
+    assert run_on_session(s2, cfg) == 0   # 有流1 → 走原逻辑（无事件 → 0 异常）
+    assert s2.recorded == [], s2.recorded
+    ok("对账前置判断正确（流1 不可用 → 只写 1 条汇总，不产出误报异常）")
+
+
+def test_nx_journal_bridge():
+    """P0-1（2026-10-23）：NxBridge 从 journal 追读到新增 menu/API 事件（不需要 NX）。"""
+    from nx_bridge import NxBridge
+    tmp = tempfile.mkdtemp(prefix="cad-ai-nxbridge-")
+    journal = Path(tmp) / "journal.cs"
+    journal.write_text("// NX journal\n// Menu: Insert->Sketch\n", encoding="utf-16")
+    events = []
+
+    def on_event(kind, detail):
+        events.append((kind, detail))
+
+    bridge = NxBridge({"journal_path": str(journal), "poll_interval_s": 0.2},
+                      on_event, lambda: True)
+    bridge.start()
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not any(
+                k == "nx_session" for k, _ in events):
+            time.sleep(0.05)
+        assert any(k == "nx_session" for k, _ in events), f"没挂上 journal: {events}"
+        assert bridge.status()["connected"] is True
+        with open(journal, "ab") as f:      # 追加新操作（UTF-16LE，无 BOM）
+            f.write("// Menu: Insert->Design Feature->Extrude...\n".encode("utf-16-le"))
+            f.write("NXOpen.Features.FeatureCollection.CreateExtrude(null)\n"
+                    .encode("utf-16-le"))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not any(
+                k == "nx_journal" for k, _ in events):
+            time.sleep(0.05)
+        nx_ev = [d for k, d in events if k == "nx_journal"]
+        assert nx_ev, f"追加后没有 nx_journal 事件: {events}"
+        assert any(d.get("type") == "menu" and "Extrude" in d.get("menu", "")
+                   for d in nx_ev), nx_ev
+        assert any(d.get("type") == "api" for d in nx_ev), nx_ev
+        ok("NX journal 桥追读正确（追加即出 menu/API 事件）")
+    finally:
+        bridge.stop()
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
 # CI 上能跑的"确定性"子集：不装钩子、不注入输入、不截图、不依赖本机装了哪家 CAD。
 # 用法：python app\selftest.py --ci   （GitHub Actions 就是这么跑的）
 CI_SAFE_TESTS = [
@@ -1115,6 +1222,8 @@ CI_SAFE_TESTS = [
     test_gesture_direction,
     test_creo_nx_parsers,
     test_reconcile,
+    test_reconcile_stream1_guard,
+    test_nx_journal_bridge,
     test_cad_discovery,
     # v4：纯文件/纯逻辑，不开钩子不截图
     test_v4_session_naming,
@@ -1144,6 +1253,8 @@ if __name__ == "__main__":
     test_ai_eye_unit()
     test_capture_dpi_box()
     test_reconcile()
+    test_reconcile_stream1_guard()
+    test_nx_journal_bridge()
     test_gesture_and_ai_eye()
     test_cad_discovery()
     # v4 会话存储（v0.2.0）用例

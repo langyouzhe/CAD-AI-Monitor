@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-selftest_nx.py —— NX(Designcenter 2512) 真机联调：启动 NX → 找 syslog → 验证解析
+selftest_nx.py —— NX 真机联调（2026-10-23 改为 Journal 数据源）
 
-NX 冷启动很慢（1~3 分钟）。测试流程：
-1. 启动 ugraf.exe（Designcenter NX 主程序）；
-2. 等它跑起来后，在 TEMP/用户目录 扫描 *.syslog；
-3. 启动采集器（仅 nx 后端），验证桥挂上 syslog 并收到事件；
-4. 结束关闭 NX。
+背景（问题清单 P0-1）：NX 的 *.syslog 是崩溃诊断日志，不含建模操作；
+流1 改读 NX「录制日志」输出的 .cs/.py。本脚本验证：
+1. 自动发现 NX 主程序（不写死路径，公司机 C:\\Siemens\\NX2406 也能找到）；
+2. 启动采集器（仅 nx 后端），桥能挂上 journal；
+3. 你手动在 NX 里操作几下 → journal 追加 → 采集器收到 menu/api 事件。
 
-注意：syslog 的路径/格式是探测版——如果扫描不到，本测试会打印诊断
-（NX 进程状态、TEMP 下的新文件），供后续校准解析器。
+用法：
+1. 先在 NX 里【工具 → 日志 → 录制】或 File → Utilities → Record Journal，
+   把 journal 保存到 桌面 / 文档 / data\\journals（任选，桥会自动找最新）；
+2. 运行本脚本（不需要手动开 NX，脚本会拉起；若 NX 已开则直接用）；
+3. 在 NX 里做几个操作（画草图/拉伸），回来看事件计数。
 """
 import json
 import os
@@ -22,32 +25,53 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cad_discovery  # noqa: E402
 from input_listener import CollectorSession  # noqa: E402
 
-NX_EXE = r"D:\Program Files\Siemens\DesigncenterNX2512\NXBIN\ugraf.exe"
 WAIT_S = 300
 
 
-def scan_syslogs(dirs):
+def journal_dirs():
+    home = Path.home()
     out = []
-    for d in dirs:
-        try:
-            for p in Path(d).glob("*.syslog"):
-                if p.is_file():
-                    out.append(p)
-        except Exception:
-            continue
+    for d in (home / "Desktop", home / "Documents", home / "Downloads",
+              Path(__file__).resolve().parent.parent / "data" / "journals"):
+        if d.is_dir():
+            out.append(str(d))
     return out
 
 
+def scan_journals(dirs):
+    from journal_parser import looks_like_journal
+    out = []
+    for d in dirs:
+        try:
+            for pat in ("*.cs", "*.py", "*.vb"):
+                for p in Path(d).glob(pat):
+                    try:
+                        if p.is_file() and p.stat().st_size > 0 and looks_like_journal(p):
+                            out.append(p)
+                    except OSError:
+                        continue
+        except Exception:
+            continue
+    return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
+
+
 def main():
-    if not Path(NX_EXE).exists():
-        print(f"找不到 NX: {NX_EXE}")
+    nx_exe = cad_discovery.nx_exe_path()
+    if not nx_exe:
+        print("找不到 NX（ugraf.exe）。请确认本机装了 NX，或告诉我路径：")
+        print("  python app\\selftest_nx.py <ugraf.exe 路径>")
         return 1
+    if len(sys.argv) > 1:
+        nx_exe = sys.argv[1]
+    print(f"NX 主程序：{nx_exe}")
+
     procs = subprocess.run(["tasklist", "/FI", "IMAGENAME eq ugraf.exe"],
                            capture_output=True, text=True).stdout
     if "ugraf.exe" not in procs.lower():
-        subprocess.Popen([NX_EXE], cwd=str(Path(NX_EXE).parent))
+        subprocess.Popen([nx_exe], cwd=str(Path(nx_exe).parent))
         print("已启动 NX（测试结束会关闭）…")
     else:
         print("NX 已在运行")
@@ -72,11 +96,12 @@ def main():
         subprocess.run(["taskkill", "/F", "/IM", "ugraf.exe"], capture_output=True)
         return 1
 
-    time.sleep(10)  # 等它写 syslog
-    dirs = [tempfile.gettempdir(), str(Path.home()),
-            r"D:\Program Files\Siemens\DesigncenterNX2512\ProgramData"]
-    found = scan_syslogs(dirs)
-    print("找到的 syslog:", [str(p) for p in found])
+    dirs = journal_dirs()
+    found = scan_journals(dirs)
+    print("找到的 journal：", [str(p) for p in found[:5]] or "（没有）")
+    if not found:
+        print("提示：先在 NX 里录制一次日志（保存到 桌面/文档/data\\journals），")
+        print("      再重新运行本脚本。syslog 不再作为数据源（问题清单 P0-1）。")
 
     tmp = tempfile.mkdtemp(prefix="cad-ai-nx-")
     with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
@@ -85,7 +110,7 @@ def main():
             "idle_minutes": 10.0,
             "debug": {"allow_all_windows": True},
             "stream1": {"enabled": True, "backends": ["nx"]},
-            "nx": {"syslog_dirs": [str(d) for d in dirs], "poll_interval_s": 1.0},
+            "nx": {"journal_dirs": dirs, "poll_interval_s": 1.0},
         }, f, ensure_ascii=False, indent=2)
 
     session = CollectorSession(tmp)
@@ -103,6 +128,7 @@ def main():
                 break
             time.sleep(2)
         print("NX 桥状态:", status or session.stats()["stream1_status"])
+        print("现在去 NX 里操作几下（画草图/拉伸），10 秒后统计…")
         time.sleep(10)
     finally:
         session.stop()
@@ -111,12 +137,12 @@ def main():
 
     events = session.store.query_session(session.session_id)
     nx_events = [e for e in events if e["source"] == "stream1"]
-    print(f"流1(NX) 事件 {len(nx_events)} 条")
-    for e in nx_events[:6]:
+    print(f"流1(NX journal) 事件 {len(nx_events)} 条")
+    for e in nx_events[:8]:
         print(f"  样例 {e['kind']}: {json.dumps(e['detail'], ensure_ascii=False)[:150]}")
     if not nx_events:
-        print("\nNX syslog 未捕获——记录诊断信息，解析器待校准")
-        print("（详见最终报告；如需继续，下次会话按实际 syslog 路径/格式校准）")
+        print("\n没有收到 NX 事件。检查：① NX 里是否正在录制日志；"
+              "② 日志保存目录是否在候选目录里；③ 可配置 nx.journal_path 指定文件。")
     else:
         print("\nNX 真机联调通过 ✔")
     return 0

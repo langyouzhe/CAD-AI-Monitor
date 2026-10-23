@@ -96,10 +96,12 @@ DEFAULT_CONFIG = {
         "poll_interval_s": 1.0,
         "stale_minutes": 10,               # trail 超过这么久没更新就提示"流1 可能收不到"
     },
-    # NX(Designcenter) 后端：探测版——解析 NX syslog 操作日志
+    # NX(Designcenter) 后端：读 NX「录制日志（Record Journal）」输出的 .cs/.py/.vb
+    # （2026-10-23 换数据源：syslog 是崩溃诊断日志，不含建模操作）
     "nx": {
         "enabled": True,
-        "syslog_dirs": [],                 # 留空 = 自动发现（%TEMP% / 用户目录 / 注册表安装路径）
+        "journal_path": "",                # ← 指定 journal 文件（最稳）；留空=自动找
+        "journal_dirs": [],                # 留空 = 默认 桌面/文档/下载/data\journals
         "poll_interval_s": 1.0,
     },
     # 笔势（按住鼠标键拖动，如 SW 右键笔势导引）记录
@@ -117,7 +119,7 @@ DEFAULT_CONFIG = {
         "api_base": "",                    # OpenAI 兼容接口地址；留空=用服务商预设；custom 必填
         "api_key": "",                     # ← 你自己注册服务后填这里
         "model": "",                       # 留空 = 用该服务商的默认视觉模型
-        "max_tokens": 4000,                # 回答额度：推理型模型（如 deepseek-flash）先思考再回答，
+        "max_tokens": 4000,                # 回答额度：推理型多模态模型会先"思考"再回答，
                                            # 给太小会把额度耗在思考上、正式回答变空 → 默认给足
         "http_timeout_s": 90,              # 单次云端调用超时（推理模型可能要十几秒）
         "delay_s": 0.15,                   # 触发后等多久再截（等菜单/对话框弹出来）
@@ -786,6 +788,10 @@ class ConfigManager:
         else:
             user_cfg = {}
         merged = self._merge(DEFAULT_CONFIG, user_cfg)
+        # P2-5：环境变量优先于配置文件，避免把 key 明文写进 config.json
+        env_key = os.environ.get("AI_EYE_KEY")
+        if env_key:
+            merged.setdefault("ai_eye", {})["api_key"] = env_key
         self._values = merged
         self.ensure_file()
         return merged

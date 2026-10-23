@@ -24,7 +24,7 @@ from pathlib import Path
 
 from pynput import keyboard, mouse
 
-from collector_core import BOUNDARY_KINDS, EventStore, now_ms
+from collector_core import EventStore, now_ms
 
 # 判断"组合键"要看哪些修饰键
 MODIFIER_NAMES = {
@@ -540,8 +540,10 @@ class CollectorSession:
             except Exception:
                 return ts
             self._counts[source if source in self._counts else "meta"] += 1
-            # v4 空会话判定：开始/停止标记是每次会话必有的"边界"，不算用户数据
-            if kind not in BOUNDARY_KINDS:
+            # v4 空会话判定：只看用户数据（stream1/stream2）。
+            # 所有 meta（开始/停止/离开/对账汇总/异常）都是边界或诊断信息，
+            # 不算"有内容"——否则新增的 stream1_unavailable 汇总会让空会话删不掉。
+            if source in ("stream1", "stream2"):
                 self._content_events += 1
             # 注意：AI 眼结果挂的是原事件的时间戳（可能早于当前），
             # 时钟只能前进不能倒退，否则离开检测会被回拨干扰。
