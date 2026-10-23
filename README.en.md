@@ -99,6 +99,8 @@ What auto-discovery looks at:
 - **NX**: `nx.journal_path` (explicit file, most reliable) → Desktop/Documents/Downloads/`data\journals`, filtered by content signature (no more syslog)
 - **Modeling-window list**: 13 mainstream CAD executables built in; editable via `modeling_apps`
 
+> **CAD installed elsewhere / another version?** No code changes needed: SolidWorks connects by ProgID (any install location), Creo finds its trail via the shortcut's start-in folder + `config.pro` + registry, and NX finds the recorded journal in user folders. If discovery fails, use the config overrides: `stream1.prog_id` / `creo.trail_dirs` / `nx.journal_path`.
+
 ## Settings
 
 `config.json` is created automatically in the data folder on first run; `config.example.json` in the repo shows every option. The most useful ones:

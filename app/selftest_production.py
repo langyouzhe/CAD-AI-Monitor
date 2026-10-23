@@ -33,7 +33,7 @@ import cad_discovery  # noqa: E402
 
 # 不限版本：自动发现本机装的是哪版 SW（SldWorks.Application 优先，再按版本倒序）
 PROG_IDS = cad_discovery.sw_progids()
-SW_EXE = cad_discovery.sw_exe_path() or r"D:\Program Files\SOLIDWORKS Corp22\SOLIDWORKS\SLDWORKS.exe"
+SW_EXE = cad_discovery.sw_exe_path() or ""   # 自动发现，不写死路径
 PLANE_NAMES = ["Front Plane", "前视基准面"]
 PLANE_NAMES2 = ["Top Plane", "上视基准面"]
 
@@ -71,6 +71,8 @@ def connect_sw():
             return sw, False
         except Exception:
             continue
+    if not SW_EXE or not Path(SW_EXE).is_file():
+        raise RuntimeError("找不到 SolidWorks 主程序（未安装？）——请先手动启动 SW 再重试")
     subprocess.Popen([SW_EXE])
     launched = True
     print("已正常启动 SolidWorks…等待就绪")

@@ -8,7 +8,7 @@ v2 新增（按最新版项目上下文）：
 - 不再显示停顿计数，改为 流1/流2 各自条数 + 离开次数；
 - 新增【打开设置】按钮：改 data\\config.json 里的建模窗口名单、离开阈值等。
 
-数据只保存在本地（默认 E:\\CAD-AI-Monitor\\data），不会联网。
+数据只保存在本地（exe 旁的 data 目录，或 文档\CAD-AI-Monitor\data），不会联网。
 """
 import json
 import os

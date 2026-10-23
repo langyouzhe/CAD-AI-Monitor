@@ -6,6 +6,22 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/) —
 `0.x` means "early, interfaces may still change".
 
+## [Unreleased]
+
+Portability cleanup: no machine-specific paths/versions in shipped code.
+
+### Changed
+
+- `resolve_data_dir()` no longer special-cases `E:\CAD-AI-Monitor`; source runs use
+  the repo's `data\`, packaged runs use the exe-side `data\` or `Documents\CAD-AI-Monitor\data`.
+- `cad_discovery.creo_trail_dirs()`: dropped the author-machine hints `D:\CREO` / `E:\creo12`
+  (public/user folders, config.pro and registry remain).
+- New `cad_discovery.creo_exe_path()`: finds `parametric.exe` via shortcut → uninstall
+  registry → bounded install-dir scan (no hardcoded path). `selftest_creo.py` uses it.
+- `selftest_solidworks.py` / `selftest_production.py`: removed the hardcoded SolidWorks
+  fallback path; they now fail with a clear hint if SW is not installed.
+- `selftest_ai_eye_live.py`: default data folder comes from `resolve_data_dir()`.
+
 ## [0.2.1] - 2026-10-23
 
 NX stream 1 now reads the **recorded journal** instead of syslog; reconciliation no

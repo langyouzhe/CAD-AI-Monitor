@@ -149,6 +149,58 @@ def sw_exe_path(cfg_path=None):
     return None
 
 
+def creo_exe_path(cfg_path=None):
+    """找 Creo 主程序 parametric.exe（不限版本/盘符；别人电脑也能找到）。
+
+    顺序：配置指定 → 快捷方式 → 注册表卸载项 → 安装目录浅层扫。
+    """
+    if cfg_path:
+        p = Path(cfg_path)
+        try:
+            if p.is_file():
+                return str(p)
+        except OSError:
+            pass
+    for name, target, workdir in iter_shortcuts():
+        blob = f"{name} {target} {workdir}".lower()
+        if "creo" not in blob and "parametric" not in blob:
+            continue
+        for cand in (target, os.path.join(workdir or "", "parametric.exe")):
+            try:
+                if cand and Path(cand).name.lower() == "parametric.exe" \
+                        and Path(cand).is_file():
+                    return str(cand)
+            except OSError:
+                continue
+    for loc in _uninstall_locations(r"Creo Parametric|Creo \d|PTC Creo|PTC"):
+        base = Path(loc)
+        for rel in (Path("Parametric") / "bin" / "parametric.exe",
+                    Path("bin") / "parametric.exe",
+                    Path("parametric.exe")):
+            try:
+                cand = base / rel
+                if cand.is_file():
+                    return str(cand)
+            except OSError:
+                continue
+        # 安装目录常嵌套版本号（…\Creo 12.4.4.0\Parametric\bin），限深度浅扫
+        visited = 0
+        stack = [(base, 0)]
+        while stack and visited < 3000:
+            cur, depth = stack.pop()
+            visited += 1
+            try:
+                for e in os.scandir(cur):
+                    if e.is_dir() and depth < 4:
+                        stack.append((Path(e.path), depth + 1))
+                    elif e.is_file() and e.name.lower() == "parametric.exe" \
+                            and "bin" in e.path.lower():
+                        return e.path
+            except OSError:
+                continue
+    return ""
+
+
 # ---------- 快捷方式（.lnk）解析 ----------
 
 _SYSTEM_ROOTS = [
@@ -265,14 +317,12 @@ def creo_trail_dirs(cfg_dirs=None):
             continue
         for m in re.finditer(r"^\s*trail_dir\s+(\S+)", text, re.M):
             add(m.group(1).strip('"'))
-    # 4) 常见目录兜底
+    # 4) 常见目录兜底（不写死具体机器：Public Documents 和用户目录是通用的）
     home = os.environ.get("USERPROFILE", "")
     add(r"C:\Users\Public\Documents")
     add(home)
     add(os.path.join(home, "Documents"))
     add(os.path.join(home, "Desktop"))
-    add(r"D:\CREO")
-    add(r"E:\creo12")
     return [d for d in dirs if d]
 
 

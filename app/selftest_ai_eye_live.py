@@ -22,7 +22,8 @@ from ai_eye import AiEye  # noqa: E402
 
 
 def main():
-    data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(r"E:\CAD-AI-Monitor\data")
+    from collector_core import resolve_data_dir
+    data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else resolve_data_dir()
     cfg_path = data_dir / "config.json"
     if not cfg_path.exists():
         print(f"找不到配置: {cfg_path}")

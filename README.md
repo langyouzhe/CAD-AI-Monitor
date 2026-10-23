@@ -119,6 +119,8 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 - **NX**：`nx.journal_path`（显式指定，最稳）→ 桌面/文档/下载/`data\journals` 里按**内容特征**找最新的录制日志（不再读 syslog）
 - **建模窗口识别**：内置 13 个主流 CAD 程序名，可在 `modeling_apps` 里增删
 
+> **软件装在别的目录 / 别的版本？** 不用改代码：SolidWorks 按 ProgID 连接（不限安装位置）、Creo 按"快捷方式启动目录 + config.pro + 注册表"找 trail、NX 按录制日志目录找 journal。实在找不到时才用配置兜底：`stream1.prog_id` / `creo.trail_dirs` / `nx.journal_path`。
+
 ## 设置项（data\config.json，改完下次开始采集生效）
 
 | 设置 | 默认 | 意思 |

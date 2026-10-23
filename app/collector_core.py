@@ -167,23 +167,18 @@ def _iso_from_ms(ts_ms: int) -> str:
 
 
 def resolve_data_dir() -> Path:
-    """决定数据存在哪个文件夹（开源通用版：不再写死 E 盘）。
+    """决定数据存在哪个文件夹（开源通用版：不写死任何盘符/目录）。
 
     规则（从高到低）：
     1. 环境变量 `CAD_AI_MONITOR_DATA` 指定的目录（服务器/多份数据时用）；
-    2. 开发机：源码仓库就在 E:\\CAD-AI-Monitor 时，用仓库里的 data
-       （保证老用户已有的采集数据还能被找到）；
-    3. 打包成 exe 后：
+    2. 打包成 exe 后：
        a. exe 旁边如果有 data 文件夹 → 用它（**绿色便携模式**，U 盘可用）；
        b. 否则用 `文档\\CAD-AI-Monitor\\data`（装在 Program Files 里也能写）；
-    4. 源码运行：用仓库里的 data。
+    3. 源码运行：用仓库里的 data。
     """
     env = os.environ.get("CAD_AI_MONITOR_DATA")
     if env:
         return Path(env).expanduser()
-    legacy_repo = Path("E:/CAD-AI-Monitor")
-    if (legacy_repo / "app" / "collector_core.py").is_file():
-        return legacy_repo / "data"
     if getattr(sys, "frozen", False):  # 打包成 exe 之后走这里
         exe_dir = Path(sys.executable).resolve().parent
         portable = exe_dir / "data"

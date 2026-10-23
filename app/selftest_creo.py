@@ -17,14 +17,17 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from input_listener import CollectorSession  # noqa: E402
+import cad_discovery  # noqa: E402
 
-CREO_EXE = r"D:\CREO\Creo12.0\Creo 12.4.4.0\Parametric\bin\parametric.exe"
+# 自动发现 Creo 主程序（不限版本/盘符；别人电脑也能找到），也可用 argv[1] 指定
+CREO_EXE = cad_discovery.creo_exe_path(sys.argv[1] if len(sys.argv) > 1 else None)
 WAIT_S = 240
 
 
 def main():
-    if not Path(CREO_EXE).exists():
-        print(f"找不到 Creo: {CREO_EXE}")
+    if not CREO_EXE or not Path(CREO_EXE).exists():
+        print("找不到 Creo 主程序 parametric.exe（未安装/未发现）。")
+        print("可以手动指定：python app\\selftest_creo.py <parametric.exe 路径>")
         return 1
     # 确认没有已在跑的 Creo
     procs = subprocess.run(["tasklist", "/FI", "IMAGENAME eq parametric.exe"],

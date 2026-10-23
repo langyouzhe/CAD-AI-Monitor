@@ -32,7 +32,7 @@ from solidworks_bridge import _get_com_member  # noqa: E402  安全读 COM 成�
 import cad_discovery  # noqa: E402
 PROG_IDS = cad_discovery.sw_progids()   # 不限版本：自动发现本机 SW 的 COM 名
 PROG_ID = PROG_IDS[0]
-SW_EXE = cad_discovery.sw_exe_path() or r"D:\Program Files\SOLIDWORKS Corp22\SOLIDWORKS\SLDWORKS.exe"
+SW_EXE = cad_discovery.sw_exe_path() or ""   # 自动发现，不写死路径
 PLANE_NAMES = ["Front Plane", "前视基准面"]  # 英文版/中文版都能选中
 WAIT_CONNECT_S = 240   # SW 冷启动 + 注册 COM 接口可能要 1~3 分钟
 
@@ -91,6 +91,9 @@ def connect_sw():
         except Exception:
             continue
     if sw is None:
+        if not SW_EXE or not Path(SW_EXE).is_file():
+            print("找不到 SolidWorks 主程序（未安装？）——请先手动启动 SW 再重试")
+            return 1
         import subprocess
         subprocess.Popen([SW_EXE])
         launched = True
