@@ -310,6 +310,43 @@ def creo_install_dirs(cfg_dirs=None):
     return dirs
 
 
+def nx_exe_path(cfg_path=None):
+    """找 NX 主程序 ugraf.exe（不限版本/盘符；家里和公司两台机通用）。
+
+    依据问题清单：「别把 NX_EXE 路径写死」。查找顺序：
+    1. 配置显式路径；
+    2. 注册表卸载项的 InstallLocation\\NXBIN\\ugraf.exe；
+    3. 常见根目录（C:\\Siemens、C/D:\\Program Files\\Siemens …）递归找。
+    """
+    if cfg_path:
+        p = Path(cfg_path)
+        if p.is_file():
+            return str(p)
+    for loc in _uninstall_locations(r"Siemens.*NX|Designcenter|NX \d"):
+        p = Path(loc) / "NXBIN" / "ugraf.exe"
+        try:
+            if p.is_file():
+                return str(p)
+        except OSError:
+            continue
+    roots = []
+    for base in (r"C:\Siemens", r"C:\Program Files\Siemens",
+                 r"D:\Program Files\Siemens", r"D:\Siemens", r"E:\Siemens"):
+        try:
+            if Path(base).is_dir():
+                roots.append(Path(base))
+        except OSError:
+            continue
+    for root in roots:
+        try:
+            for exe in root.rglob("ugraf.exe"):
+                if "nxbin" in str(exe).lower():
+                    return str(exe)
+        except OSError:
+            continue
+    return ""
+
+
 def nx_syslog_dirs(cfg_dirs=None):
     """NX syslog 文件的候选目录。"""
     import tempfile

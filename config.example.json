@@ -76,7 +76,8 @@
   },
   "nx": {
     "enabled": true,
-    "syslog_dirs": [],
+    "journal_path": "",
+    "journal_dirs": [],
     "poll_interval_s": 1.0
   },
   "gestures": {

@@ -103,8 +103,8 @@ class AiEye:
         self.max_queue = int(self.cfg.get("max_queue", 20))
         self.dedup_s = float(self.cfg.get("dedup_window_s", 0.5))
         self.keep_images = bool(self.cfg.get("save_images", True))
-        # 推理型多模态模型（如 deepseek-flash）会先"思考"再回答：额度给太小，
-        # 思考就把额度吃光 → 正式回答为空。所以默认给足，并允许设置里调。
+        # 推理型多模态模型会先"思考"再回答：额度给太小，思考就把额度吃光 →
+        # 正式回答为空。所以默认给足，并允许设置里调。
         self.max_tokens = int(self.cfg.get("max_tokens", 4000))
         self.http_timeout_s = float(self.cfg.get("http_timeout_s", 90))
         # 停止采集时等在途云端请求做完的上限（秒）：排空队列后再关库

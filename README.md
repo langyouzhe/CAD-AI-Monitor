@@ -22,7 +22,7 @@
 
 | 流 | 记什么 | 例子 |
 |---|---|---|
-| **流1（手）** | 软件接口报出的模型变化：打开什么文档、**选中了哪个面/边/特征**、特征树增删改、执行了什么命令 | SW：`selectionChanged`（选中了面）；Creo：`creo_trail`（菜单操作流水）；NX：`nx_syslog`（探测版） |
+| **流1（手）** | 软件接口报出的模型变化：打开什么文档、**选中了哪个面/边/特征**、特征树增删改、执行了什么命令 | SW：`selectionChanged`（选中了面）；Creo：`creo_trail`（菜单操作流水）；NX：`nx_journal`（录制日志里的 `Menu:` / NXOpen 调用） |
 | **流2（眼）** | 你在建模软件窗口里的实际操作：点击、按键、快捷键、**笔势（按住拖动）** | `key_down`（按了 s，本地翻译成命令名）、`gesture`（右上笔势，带方向和命令 ID） |
 | **流2·AI 眼** | 点击/快捷键/笔势/选中变化瞬间，截**整个建模窗口**一张图→云端视觉模型识别，结果挂回原事件时间戳 | 识别"点了什么/界面状态/有无报错"，结果入库，图存本次会话的 `data\sessions\<开始时刻>\images\` |
 | **对账（meta）** | 停止采集时自动**三方对账**：动作↔流1效果↔视觉结论，缺票自动标异常 | `meta/anomaly`（stream2_no_effect / stream1_orphan / visual_missing / visual_failed） |
@@ -30,7 +30,7 @@
 
 > **版本号怎么看**：公开发布用**语义化版本**，当前是 **v0.2.0**（`0.x` 表示"早期版本、接口可能变"；等它稳定到别人可以放心用了，才发 `1.0.0`）。文档和代码注释里偶尔出现的 **v2 / v3 / v4** 是开发过程中的**内部迭代编号**（第 2 代架构 → 第 3 代加视觉 → 第 4 代会话存储），**不是发布版本号**，别混淆。
 
-**当前已实现**：笔势记录、SW 快捷键本地翻译、AI 眼（视觉）、Creo 桥、NX 桥（探测版）、三方对账、CAD 自动发现。
+**当前已实现**：笔势记录、SW 快捷键本地翻译、AI 眼（视觉）、Creo 桥、NX 桥（Journal）、三方对账、CAD 自动发现。
 
 ## 核心规矩（不变）
 
@@ -105,16 +105,18 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 |---|---|---|
 | SolidWorks **2022** | ✅ 本机实测 | COM 接口，优先用**不限版本**的 `SldWorks.Application`，再按版本倒序枚举 |
 | Creo Parametric **12.4** | ✅ 本机实测 | 读 trail 操作流水账文件（自动找到你的 Creo 启动目录） |
-| Designcenter NX **2512** | 🟡 探测版 | 读 syslog；已能挂上，操作命令行格式待真实使用校准 |
+| NX（任意版本） | ✅ 本机实测（Designcenter 2512 / NX 2406） | 读 NX「录制日志」输出的 `.cs/.py`：`Menu:` 注释 + NXOpen 调用；**需先在 NX 里录制一次日志**（见下方"NX 用户注意"） |
 | SolidWorks 其它版本（2015~2025） | ⚪ 理论支持、待你验证 | 同上（ProgID 自动发现；快捷键/笔势注册表也按版本自动枚举） |
 | Creo 其它版本（7/8/9/10/11…） | ⚪ 理论支持、待你验证 | 同上（trail 格式各版本基本一致） |
 | Inventor / AutoCAD / Solid Edge / FreeCAD / Fusion | ⚪ 只能记"你在用这个软件" | 流2（键鼠+AI 眼）照常；流1 需要有人再写一个桥 |
+
+> **NX 用户注意**：流1 读的是 NX 的「录制日志」文件（`.cs/.py`），不是 syslog。用法：在 NX 里 `File → Utilities → Record Journal`（或 `Tools → Journal → Record`）开始录制，保存到桌面/文档/`data\journals`；采集器会自动找最新一份，也可在设置里用 `nx.journal_path` 指定。syslog 是崩溃诊断日志，已不再使用。
 
 自动发现具体找什么：
 
 - **SW**：`SldWorks.Application`（不限版本）→ `SldWorks.Application.NN` 按版本倒序 → 注册表 `HKCU\Software\SolidWorks\SOLIDWORKS <年份>`
 - **Creo**：快捷方式记录的**启动目录**（trail 就写在启动目录里）→ `config.pro` 的 `trail_dir` → 用户目录/文档/桌面
-- **NX**：`%TEMP%` → 用户目录 → 注册表里的安装路径
+- **NX**：`nx.journal_path`（显式指定，最稳）→ 桌面/文档/下载/`data\journals` 里按**内容特征**找最新的录制日志（不再读 syslog）
 - **建模窗口识别**：内置 13 个主流 CAD 程序名，可在 `modeling_apps` 里增删
 
 ## 设置项（data\config.json，改完下次开始采集生效）
@@ -133,7 +135,7 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 | `ai_eye.drain_timeout_s` | `5.0` | 停止采集时，等在途云端请求做完的上限（秒）→ 排空队列再关库 |
 | `ai_eye.triggers` | 左键/快捷键/字母键/笔势开，右键关 | AI 眼截图触发规则 |
 | `ai_eye.rate_per_min` | `60` | 限流：每分钟最多截几张 |
-| `creo.trail_dirs` / `nx.syslog_dirs` | 空=自动发现 | 手动指定 trail/syslog 位置（一般不用填） |
+| `creo.trail_dirs` / `nx.journal_path` / `nx.journal_dirs` | 空=自动发现 | 手动指定 trail 或 NX 录制日志（`.cs/.py`）的文件/目录；最稳的是 `nx.journal_path` |
 | `creo.stale_minutes` | `10` | trail 超过这么久没更新就提示"流1 可能收不到" |
 | `reconcile.window_ms` | `2000` | 对账窗口：动作之后多久内的流1 事件算它的"效果" |
 | `reconcile.ignore_middle` | `true` | 中键/滚轮不算动作（旋转视图本来没有流1 事件） |
@@ -141,8 +143,10 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 ## 开 AI 眼的三步（要你自己的 key）
 
 1. 去智谱（open.bigmodel.cn）/ 阿里云百炼 / 火山引擎注册，开通视觉模型，复制 API Key；
-2. 用【打开设置】打开 `config.json`：`ai_eye.enabled` 改 `true`，`api_key` 填你的 key，`provider` 改成对应名字（`zhipu`/`qwen`/`doubao`），保存；
+2. 用【打开设置】打开 `config.json`：`ai_eye.enabled` 改 `true`，`api_key` 填你的 key，`provider` 改成对应名字（`zhipu`/`qwen`/`doubao`/`custom`），`model` 填该服务商的**视觉模型**（zhipu 用 `glm-4v-flash`、qwen 用 `qwen-vl-plus`；留空则用预设），保存；
 3. 重新点【开始采集】。费用：每张图约 1~5 分钱，每分钟上限 60 张。
+
+> ⚠️ **别把 model 填成 `deepseek-flash`**：DeepSeek 官方 API 只有文本模型（`deepseek-chat` / `deepseek-reasoner`），**不能看图**；2026-10-23 实测还有网络出口挡 `api.deepseek.com`。视觉识别请用智谱/阿里/火山这类多模态服务。想不用明文 key，可以设环境变量 `AI_EYE_KEY`（优先于 config.json）。
 
 ## SW 快捷键与笔势的本地翻译（零 AI）
 
@@ -166,14 +170,14 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 | 再点开始采集，提示"已在采集中"？ | 程序同一时间只允许一个实例（防止两个实例同时写数据）。请切换到已经开着的那个窗口，不要重复双击 exe。 |
 | Creo 的 trail 文件在哪？ | **在你 Creo 快捷方式的"起始位置"目录里**（本机实测 `C:\Users\Public\Documents`）；程序会自动解析快捷方式找出来。⚠️ 注意 `D:\CREO\...\Parametric\bin\` 下那个 `trail.txt.1` 是 PTC 自带的**样板文件**，不是你的操作记录——已修好，不会再认错 |
 | 流1 是空的怎么办？ | 先看界面/状态里的提示：① "没找到 trail 文件" = Creo 没运行过；② "trail 文件 N 分钟没更新" = 桥挂的文件不是活的（真 trail 在别的目录，可在 `creo.trail_dirs` 里手动指定）③ SW/NX 没数据先确认软件真的打开了 |
-| NX 后端没数据？ | NX(Designcenter) 后端是**探测版**：syslog 挂接已验证（TEMP 下 `*.syslog`），但操作命令行格式要等你真实用一次 NX 后校准 |
+| NX 后端没数据？ | 流1 现在读 **NX 录制日志**（`.cs/.py`），不再读 syslog（syslog 是崩溃诊断日志，里面没有建模操作）。用法：在 NX 里 `File → Utilities → Record Journal` 开始录制，保存到桌面/文档/`data\journals`；采集器会自动找最新一份，或设置 `nx.journal_path` 指定文件。 |
 | 换电脑？ | 拷 exe 过去即可（数据默认写 `文档\CAD-AI-Monitor\data`；exe 旁有 `data` 文件夹时优先用它）。整个 `data\sessions\` 文件夹也能单独拷走——一个会话就是一个完整数据包。流1 需要那台电脑装了对应 CAD，版本不限 |
 | 验证程序没坏？ | `CAD-AI-Collector.exe --selftest`；各软件联调：`python app\selftest_solidworks.py` / `selftest_creo.py` / `selftest_nx.py` |
 
 ## 已知限制（记在案）
 
-1. **AI 眼**：mock 模式与**真实云端都已验证**（2026-10-12 用你自己的 deepseek-flash key 首测通过：6 秒返回标准 JSON、图落盘、时间戳对齐）。注意推理型模型（deepseek-flash）会先思考再回答，`max_tokens` 给小了回答会是空的——默认 4000，可在设置里调大；`deepseek-v4-pro` 实测**不支持图片**。
-2. **NX 后端探测版**：本机实测 syslog 存在且桥能挂上；`run_journal.exe` 与 Journal 测试例程都在，Journal 路线成立；命令行解析待真实使用后校准。
+1. **AI 眼**：mock 模式与真实云端都验证过。**视觉模型必须是多模态**：zhipu `glm-4v-flash`、qwen `qwen-vl-plus` 等；DeepSeek 官方 API（`deepseek-chat`/`deepseek-reasoner`）是纯文本，不能看图，`deepseek-flash` 这个模型名也不存在（2026-10-23 问题清单）。推理型模型会先思考再回答，`max_tokens` 给小了回答会是空的——默认 4000，可在设置里调大。
+2. **NX 数据源（2026-10-23 换）**：syslog 是崩溃诊断日志，不含建模操作（4 次历史会话流1 全空）；现在读 NX「录制日志」的 `.cs/.py`，解析 `Menu:` 注释与 NXOpen 调用。**需要你先在 NX 里录制一次日志**（Journal），或配置 `nx.journal_path`。自动开录制（点开始采集就自动录）是下一步（步骤 6），本轮未做。
 3. **笔势命令名**：方向 100% 准确 + 原始命令 ID 已记。"ID→命令名"对照表**不在仓库里分发**（它来自 SolidWorks 自己的类型库，再分发有法律争议）：程序第一次运行时会**从你本机装的 SW 现场生成**一张表存到 `data\sw_command_ids.json`。⚠ 本机实测 SW2022 的类型库编号与注册表里的旧编号对不上，所以这台机器上翻不出名字——这是已知限制，不是 bug；中文名可以手动填 `data\sw_shortcut_map.json`。想提前生成可以运行 `python app\sw_shortcuts.py --generate data`。
 4. **对账是软提示**：`stream2_no_effect` 可能是纯视图操作（如点一下空白处），`stream1_orphan` 可能是外部程序改动——标出来供你判断，不自动删数据。
 5. **截图范围**：已适配**双屏/多显示器**（抓所有显示器）与 **DPI 缩放**（按系统 DPI 换算、减虚拟屏原点），窗口在主屏或副屏都能截对。
@@ -198,11 +202,12 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 | 文件 | 职责 |
 |---|---|
 | `app\collector_core.py` | 核心：配置 + **会话文件夹（v4）+ 旧库归档 / 崩溃会话扫描** + 本地存储 + 跨会话小结命令行 |
-| `app\cad_discovery.py` | **CAD 自动发现**：不限版本 ProgID / 注册表版本枚举 / trail·syslog 目录探测 / 建模程序名清单 |
+| `app\cad_discovery.py` | **CAD 自动发现**：不限版本 ProgID / 注册表版本枚举 / trail·journal 目录探测 / NX 主程序查找 / 建模程序名清单 |
 | `app\input_listener.py` | 流2：钩子 + 装聋 + 笔势 + 离开/回来 + AI 眼触发 |
 | `app\solidworks_bridge.py` | 流1·SW：COM 抓拍比对 |
 | `app\creo_bridge.py` | 流1·Creo：trail 解析 + mapkey |
-| `app\nx_bridge.py` | 流1·NX：syslog 解析（探测版） |
+| `app\nx_bridge.py` | 流1·NX：录制日志（journal）追踪 + menu/API 解析 |
+| `app\journal_parser.py` | NX journal 解析（`Menu:` 注释 + NXOpen 调用；自动识别 UTF-16/UTF-8） |
 | `app\ai_eye.py` | AI 眼：截图→云端→入库 |
 | `app\reconcile.py` | 三方对账：缺票自动标异常 |
 | `app\app.py` | 界面 |
