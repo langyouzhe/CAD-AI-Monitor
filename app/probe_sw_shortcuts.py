@@ -9,7 +9,7 @@ probe_sw_shortcuts.py —— 真机探测 SW 的"命令名 ↔ ID"翻译接口�
 3. ICommandManager / ICommand 有没有名字翻译。
 
 用法：python probe_sw_shortcuts.py
-SW 没开会正常启动一个（测完关闭）。
+SW 没开会正常启动一个（测完**只按 PID 关自己 Popen 的进程树**，不调用 COM ExitApp）。
 """
 import json
 import os
@@ -63,15 +63,55 @@ def read_reg_gesture_ids():
     return out
 
 
+def close_started(proc):
+    """只关闭**本脚本自己启动**的进程（按 PID；绝不按镜像名 /IM 全杀）。
+
+    没启动过（proc=None）→ 什么都不做。
+    """
+    if proc is None:
+        return False
+    try:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
+def cleanup_after_test(sw, launched_proc):
+    """收尾：只按 PID 关自己 Popen 的进程树；**不调用 COM ExitApp**。
+
+    GetActiveObject 可能拿到用户原本开着的 SW 实例，按 COM 实例关会丢未保存模型。
+    无法证明归属（launched_proc=None）→ 什么都不动。
+    """
+    if launched_proc is not None:
+        closed = close_started(launched_proc)
+        if closed:
+            print("已按 PID 关闭本次脚本启动的 SolidWorks 进程树"
+                  f"（PID={launched_proc.pid}，未调用 COM ExitApp）")
+        else:
+            print(f"关闭本次脚本启动的 SolidWorks 失败（PID={launched_proc.pid}）")
+        return closed
+    if sw is not None:
+        print("SolidWorks 原本就在运行 → 保持打开（不会关掉你自己的实例）")
+    else:
+        print("未连接 SolidWorks（本脚本没有关闭任何实例）")
+    return False
+
+
 def connect_sw():
-    launched = False
+    """连接 SW；没开就正常启动一个。返回 (sw, launched_proc)。
+
+    launched_proc=None → 用户原本就开着（绝不能关）；只有自己 Popen 的进程
+    才会在收尾时按 PID 关闭。
+    """
+    launched_proc = None
     try:
         sw = win32com.client.GetActiveObject(PROG_ID)
         print("已连接运行中的 SolidWorks")
     except Exception:
-        subprocess.Popen([SW_EXE])
-        launched = True
-        print("已正常启动 SolidWorks（测完会关）…等待就绪")
+        launched_proc = subprocess.Popen([SW_EXE])
+        print("已正常启动 SolidWorks（本次脚本启动，测完只按 PID 关它）…等待就绪")
         sw = None
         deadline = time.monotonic() + 240
         while sw is None and time.monotonic() < deadline:
@@ -81,17 +121,18 @@ def connect_sw():
             except Exception:
                 pass
         if sw is None:
+            close_started(launched_proc)
             raise RuntimeError("SW 启动超时")
     rev = sw.RevisionNumber
     print(f"SW 版本: {rev}")
-    return sw, launched
+    return sw, launched_proc
 
 
 def main():
     pythoncom.CoInitialize()
     reg = read_reg_gesture_ids()
     print(f"注册表笔势值: {json.dumps(reg, ensure_ascii=False)}")
-    sw, launched = connect_sw()
+    sw, launched_proc = connect_sw()
 
     # 1) 逐个试候选翻译接口
     for name in CANDIDATES:
@@ -138,12 +179,7 @@ def main():
     except Exception as exc:
         print(f"  GetCommandManager 失败: {str(exc)[:100]}")
 
-    if launched:
-        try:
-            sw.ExitApp()
-            print("已关闭 SolidWorks")
-        except Exception:
-            pass
+    cleanup_after_test(sw, launched_proc)
     return 0
 
 

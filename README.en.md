@@ -10,7 +10,7 @@ A local-first collector that records *how* you actually model in SolidWorks / Cr
 
 > ⚖️ **Trademark notice** — This is an independent personal project. It is **not affiliated with, authorized, sponsored or endorsed by** Dassault Systèmes, PTC, Siemens or their affiliates. SolidWorks®, Creo® and NX™ are trademarks of their respective owners and are named here **only to describe compatibility**. The tool reads data that these applications themselves produce or expose locally (COM interface, Creo trail files, NX recorded journals). It does not modify, crack or bypass any software licensing.
 
-> 🏷️ **Versioning** — Public releases follow semantic versioning; the current release is **v0.2.1** (`0.x` = early, interfaces may still change). Labels such as *v2* / *v3* / *v4* that appear in code comments or the Chinese documentation are **internal development generations** (2nd architecture → 3rd adds vision → 4th adds per-session storage), not release versions.
+> 🏷️ **Versioning** — Public releases follow semantic versioning; the current release is **v0.2.2** (`0.x` = early, interfaces may still change). Labels such as *v2* / *v3* / *v4* that appear in code comments or the Chinese documentation are **internal development generations** (2nd architecture → 3rd adds vision → 4th adds per-session storage), not release versions.
 
 > 🔒 **Privacy** — This program is technically a keyboard/mouse recorder, so please read [PRIVACY.md](PRIVACY.md) before using it. Short version: it only records while a CAD window is in front, everything is stored locally, and the only network activity is the optional AI Eye that you enable with your own API key.
 
@@ -26,7 +26,7 @@ Double-click it, model normally, and it logs a timestamped, multi-stream record 
 |---|---|---|
 | **Stream 1 (hands)** | Model changes reported by the CAD's own interface: which document is open, **which face/edge/feature you selected**, feature-tree additions/removals, executed commands | SolidWorks: `selectionChanged`; Creo: `creo_trail` (menu/command log); NX: `nx_journal` (`Menu:` comments + NXOpen calls from the recorded journal) |
 | **Stream 2 (eyes)** | What you physically did inside the CAD window: clicks, keys, shortcuts, **gestures (button drags)** | `key_down` (local lookup turns `s` into a command name), `gesture` (direction + command id) |
-| **Stream 2 · AI Eye** | On a trigger, screenshots the **whole CAD window** and asks your vision model what happened; the answer is stored on the original event's timestamp | `data\sessions\<start time>\images\` keeps the JPEGs |
+| **Stream 2 · AI Eye** | On a trigger, captures the **one CAD window that triggered it** directly from that window's own drawing surface (`PrintWindow`; if both PrintWindow attempts fail it falls back to a BitBlt from the same window's device context — still that window's pixels, never the screen; the screen is never grabbed or cropped) and asks your vision model what happened; the answer is stored on the original event's timestamp | `data\sessions\<start time>\images\` keeps the JPEGs |
 | **Reconciliation** | On stop, cross-checks action ↔ stream-1 effect ↔ vision result and flags missing evidence as `meta/anomaly` | `stream2_no_effect`, `stream1_orphan`, `visual_missing`, `visual_failed` |
 | **meta** | Session start/stop and leave/return markers (no idle events) | idle threshold is configurable |
 
@@ -34,7 +34,7 @@ Double-click it, model normally, and it logs a timestamped, multi-stream record 
 
 1. **Deaf mode (装聋)** — input is only recorded while a configured CAD window is in the foreground. Switch to a browser and it stops immediately.
 2. **No pause events** — every row carries a timestamp; idle time is just the gap between rows.
-3. **Screenshots are your call** — with `save_images: true` (default) JPEGs are kept in the current session's `images\` folder (`data\sessions\<start time>\images\`); set it to `false` and screenshots never touch the disk.
+3. **Screenshots are your call** — with `save_images: true` (default) JPEGs are kept in the current session's `images\` folder (`data\sessions\<start time>\images\`); set it to `false` and screenshots never touch the disk. A capture is taken **directly from the CAD window that triggered it (Windows `PrintWindow`) — the screen is never grabbed and cropped** (if both PrintWindow attempts fail, it falls back to a BitBlt from that same window's device context, which still contains only that window's pixels). The window identity (HWND + exe/title) is verified right before the capture and verified again right after it; if either check fails, the image is discarded and the task is skipped — **there is no full-screen fallback and a non-CAD window is never captured**. An invalid/minimized window rectangle is rejected before any capture happens.
 4. **Local only** — no server, no account, no telemetry. The single optional network call is the AI Eye (see [PRIVACY.md](PRIVACY.md)).
 
 ## How to use
@@ -85,12 +85,14 @@ The absolute screenshot paths stored inside the old database are rewritten to th
 |---|---|---|
 | SolidWorks **2022** | ✅ tested by the author | COM; tries the version-independent `SldWorks.Application` first, then enumerates `SldWorks.Application.*` |
 | Creo Parametric **12.4** | ✅ tested by the author | parses the Creo trail file, located through the shortcut's *Start in* folder |
-| NX (any version) | ✅ tested on 2512 / 2406 | reads the `.cs/.py` file produced by NX **Record Journal** (`Menu:` comments + NXOpen calls); you must record a journal first (see “NX users: record a journal”) |
+| NX (any version) | ✅ tested on NX 2512; NX 2406 **pending re-test** | reads the `.cs/.py` file produced by NX **Record Journal** (`Menu:` comments + NXOpen calls); you must record a journal first (see “NX users: record a journal”) |
 | Other SolidWorks versions (2015–2025) | ⚪ should work, unverified | same mechanism; shortcut/gesture registry keys are enumerated per version |
 | Other Creo versions (7–11) | ⚪ should work, unverified | same mechanism; trail format is stable across versions |
 | Inventor / AutoCAD / Solid Edge / FreeCAD / Fusion | ⚪ stream 2 only | keyboard/mouse + AI Eye still work; stream 1 needs a dedicated bridge |
 
 > **NX users — record a journal**: stream 1 reads the file produced by NX **Record Journal** (`.cs/.py`), not syslog. In NX use `File → Utilities → Record Journal` (or `Tools → Journal → Record`) and save it to Desktop/Documents/`data\journals`; the collector picks the newest one, or set `nx.journal_path`. syslog is a crash-diagnostic log and is no longer used.
+
+> **NX recording reminder (remind — never fake automation)**: NX's recording API can only be called from inside the NX process (`run_journal.exe -nx` is batch mode — NX exits when the script ends; the startup folder only reads menu files and does not execute Python), so the collector **cannot start a recording in a running NX session from outside**. What it does instead is *remind + one-click locate*: while NX is in the foreground and no journal has been found yet, the UI shows a red hint ("click `File → Utilities → Record Journal` in NX, or set `nx.journal_path`"); journals are looked up in `data\journals\` by default, and the **Open NX journal folder** button creates and opens that folder. Turn the hint off with `nx.hint_when_not_recording: false` in `config.json`.
 
 What auto-discovery looks at:
 
@@ -112,6 +114,7 @@ What auto-discovery looks at:
 | `stream1.backends` | `["solidworks","creo","nx"]` | which CAD backends to run |
 | `stream1.prog_id` | empty = auto | SolidWorks COM ProgID override |
 | `creo.trail_dirs` / `nx.journal_path` / `nx.journal_dirs` | empty = auto | manual override for the Creo trail or the NX recorded journal (`.cs/.py`); `nx.journal_path` is the most reliable |
+| `nx.hint_when_not_recording` | `true` | show a hint while NX is in the foreground but no journal has been found (`false` disables it) |
 | `creo.stale_minutes` | `10` | warn when the attached trail file stops updating |
 | `ai_eye.enabled` | `false` | master switch for the AI Eye |
 | `ai_eye.provider` | `mock` | `mock` / `zhipu` / `qwen` / `doubao` / `custom` |
@@ -138,7 +141,7 @@ cd CAD-AI-Monitor
 python -m pip install -r app\requirements.txt
 
 python app\app.py          :: run from source
-python app\selftest.py     :: 25 self-tests, no CAD required
+python app\selftest.py     :: 34 self-tests, no CAD required
 app\build.bat              :: build release\CAD-AI-Collector.exe
 release\CAD-AI-Collector.exe --selftest   :: exit code 0 = healthy
 ```
@@ -162,7 +165,7 @@ Tested with Python 3.12 on Windows 11. `build.bat` finds Python by itself (overr
 ## Known limitations
 
 1. **Windows only.** It relies on Win32 COM, global input hooks and Windows registry.
-2. **NX uses the recorded journal** (since 2026-10-23). syslog contained only startup/crash diagnostics; a probe of four sessions found zero modeling events. Record a journal in NX (or set `nx.journal_path`); auto-starting the recording from the collector is the next step (not done yet).
+2. **NX uses the recorded journal** (since 2026-10-23). syslog contained only startup/crash diagnostics; a probe of four sessions found zero modeling events. Record a journal in NX (or set `nx.journal_path`). **Auto-starting a recording from the collector is not possible** — NX's recording API is in-process only — so the tool only *reminds* you and opens the journal folder; there is no UI automation or simulated clicking.
 3. **Reconciliation is advisory.** `stream2_no_effect` may just be a view-only click; nothing is deleted automatically. When stream 1 has no source at all, reconciliation is skipped and a single `meta/stream1_unavailable` marker is written instead of one false anomaly per click.
 4. **AI Eye requires a multimodal model.** DeepSeek's public API (`deepseek-chat`/`deepseek-reasoner`) is text-only and `deepseek-flash` is not a valid model name; use Zhipu `glm-4v-flash`, Qwen `qwen-vl-plus`, etc.
 5. **No code signature.** Expect SmartScreen warnings; each release lists a SHA-256 checksum so you can verify the download.

@@ -13,6 +13,16 @@ input_listener.py —— 采集层：全局键盘/鼠标监听 + 当前窗口跟
   `data\sessions\<yyyy-mm-dd_HHMMSS>\`（images\ + data\events.db + session.json）；
   空会话停止时删除整个文件夹；停止顺序改为"先停采集源 → 排空 AI 眼队列（上限约 5 秒）
   → 对账 → 写 session.json → WAL checkpoint 关库"。
+- v0.2.2（2026-10-23 全程序检查修复）：
+  1. AI 眼触发时记录前台窗口身份（hwnd + exe/title + 触发时刻）；截图改为
+     **按目标窗口抓取（PrintWindow）**，抓取前复核身份、抓取后再复核一次，
+     不通过就跳过并丢弃图片（不保存/不上传）；没有整屏截图/裁剪路径；
+  2. 装聋只认 exe：exe 已知但不是 CAD → 标题再像也拒绝；exe 取不到才用标题兜底；
+  3. 写库失败不再静默：设 self.error + 标记写入失败，停止时保留会话并标
+     session.json status="error"（不标 completed、不当空会话删）；
+  4. 建 NX 桥时传实际数据根目录，桥默认 journal 目录与界面按钮同源；
+  5. NX 录制提醒复用 exe 优先规则：exe 已知非 NX → 标题含 NX 也不提示
+     （浏览器/搜索页标题不再误报）；exe 取不到才按标题兜底。
 
 本文件不含界面；流1 桥接在 solidworks_bridge.py，AI 眼在 ai_eye.py。
 """
@@ -24,7 +34,7 @@ from pathlib import Path
 
 from pynput import keyboard, mouse
 
-from collector_core import EventStore, now_ms
+from collector_core import EventStore, now_ms, nx_journal_dir
 
 # 判断"组合键"要看哪些修饰键
 MODIFIER_NAMES = {
@@ -45,6 +55,11 @@ MODIFIER_NAMES = {
 # 笔势 8 方向名称（按角度扇区顺序：右→逆时针一圈）
 GESTURE_DIRECTIONS = ["右", "右上", "上", "左上", "左", "左下", "下", "右下"]
 
+# NX 主程序名（nx_record_hint 的 exe 优先判定）：只有这些 exe 才算 NX。
+# 浏览器/聊天窗口的标题里带 "NX" 不能被当成 NX（和装聋 is_modeling_window
+# 同一条规则：exe 已知时标题不再"救"它）。
+NX_EXECUTABLES = ("ugraf.exe", "nx.exe")
+
 
 def classify_gesture_direction(dx, dy):
     """把"起点→终点"的位移向量归到 8 个方向之一（屏幕坐标 y 向下）。
@@ -58,61 +73,177 @@ def classify_gesture_direction(dx, dy):
     return GESTURE_DIRECTIONS[sector]
 
 
+def _window_title(hwnd):
+    """读窗口标题（取不到返回 None，绝不抛异常）。"""
+    try:
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+        return buf.value or None
+    except Exception:
+        return None
+
+
+def _window_exe(hwnd):
+    """读窗口所属进程的程序名（如 ugraf.exe；取不到返回 None，绝不抛异常）。"""
+    try:
+        pid = wt.DWORD()
+        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return None
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value
+        )
+        if not handle:
+            return None
+        try:
+            size = wt.DWORD(4096)
+            path_buf = ctypes.create_unicode_buffer(size.value)
+            ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                handle, 0, path_buf, ctypes.byref(size)
+            )
+            return Path(path_buf.value).name if ok else None
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def foreground_window_identity():
+    """当前前台窗口身份：(hwnd, 标题, 程序名)。
+
+    取不到 hwnd 时返回 (0, None, None)——AI 眼拿到 hwnd=0 会直接跳过截图，
+    绝不"猜一个窗口"或退化成整屏（隐私红线）。
+    """
+    try:
+        hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    except Exception:
+        hwnd = 0
+    if not hwnd:
+        return 0, None, None
+    return hwnd, _window_title(hwnd), _window_exe(hwnd)
+
+
+def window_state(hwnd):
+    """查询某个窗口**此刻**的状态（AI 眼截图前复核用）。
+
+    返回 {"alive": bool, "foreground": bool, "title": str|None, "exe": str|None}。
+    hwnd 为 0/无效 → alive=False（调用方据此跳过截图，不截任何东西）。
+    """
+    try:
+        hwnd = int(hwnd or 0)
+    except (TypeError, ValueError):
+        hwnd = 0
+    state = {"alive": False, "foreground": False, "title": None, "exe": None}
+    if not hwnd:
+        return state
+    try:
+        user32 = ctypes.windll.user32
+        state["alive"] = bool(user32.IsWindow(hwnd))
+        state["foreground"] = int(user32.GetForegroundWindow() or 0) == hwnd
+        if state["alive"]:
+            state["title"] = _window_title(hwnd)
+            state["exe"] = _window_exe(hwnd)
+    except Exception:
+        pass
+    return state
+
+
 def foreground_window_info():
     """拿到"当前最前面的窗口"的 (标题, 程序名)。
 
     取不到时返回 (None, None)，绝不因为一个窗口报错就停下整个采集。
     """
-    try:
-        hwnd = ctypes.windll.user32.GetForegroundWindow()
-        if not hwnd:
-            return None, None
-        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(length + 1)
-        ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = buf.value or None
-
-        pid = wt.DWORD()
-        ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        exe = None
-        if pid.value:
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value
-            )
-            if handle:
-                size = wt.DWORD(4096)
-                path_buf = ctypes.create_unicode_buffer(size.value)
-                ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
-                    handle, 0, path_buf, ctypes.byref(size)
-                )
-                ctypes.windll.kernel32.CloseHandle(handle)
-                if ok:
-                    exe = Path(path_buf.value).name
-        return title, exe
-    except Exception:
-        return None, None
+    _, title, exe = foreground_window_identity()
+    return title, exe
 
 
 def is_modeling_window(info, modeling_apps, allow_all=False):
     """判断一个 (标题, 程序名) 是不是建模软件窗口。
 
     - allow_all=True（调试开关）：什么窗口都算。
-    - exe 完全匹配，或标题包含关键词，都算命中。
+    - **exe 取得到**：只认 exe 完全匹配——标题再像也不算。
+      这是"装聋"的隐私边界：浏览器标题里带 NX / SOLIDWORKS（搜索页、网盘
+      文件名、聊天窗口标题）不能被当成 CAD 窗口，否则会把浏览器里的操作记下来。
+    - **exe 取不到（空）**：才退回标题关键词匹配（兼容权限不足拿不到进程名的
+      情况；这是唯一的兜底路径）。
     """
     if allow_all:
         return True
-    title, exe = info
-    if not title and not exe:
+    title, exe = (info or (None, None))[:2]
+    exe_l = str(exe or "").strip().lower()
+    if exe_l:
+        # exe 已知 → 只按 exe 规则判定，标题不再"救"它
+        return any((app.get("exe") or "").lower() == exe_l for app in modeling_apps)
+    title_l = str(title or "").strip().lower()
+    if not title_l:
         return False
-    for app in modeling_apps:
-        app_exe = (app.get("exe") or "").lower()
-        app_title = (app.get("title") or "").lower()
-        if app_exe and exe and exe.lower() == app_exe:
-            return True
-        if app_title and title and app_title in title.lower():
-            return True
-    return False
+    return any((app.get("title") or "").lower() and
+               (app.get("title") or "").lower() in title_l
+               for app in modeling_apps)
+
+
+def nx_record_hint(current_window, stream1_status, cfg, data_dir=None):
+    r"""NX 手动录制提醒（纯函数：不读全局、不碰 Windows API，可直接单测）。
+
+    为什么只做"提醒"、不做自动开录制：NX 的录制 API 只能在 NX 进程内调用——
+    `run_journal.exe -nx` 是批处理（脚本跑完 NX 就退出，不能交互建模）；
+    startup 目录只读菜单文件、不执行 Python。外部程序没法让正在运行的 NX
+    开始录制，所以这里只管"用户切到 NX、却忘了点录制"时提醒一句，
+    并给出录制日志该放哪。**不做任何界面自动化/模拟点击。**
+
+    命中条件（全部满足才返回提示，否则返回 None）：
+    1. 本次会话启用了 nx 后端（stream1.enabled 且 stream1.backends 含 "nx"）；
+    2. nx.hint_when_not_recording 没被关掉（默认开）；
+    3. 前台窗口是 NX：**exe 优先**——exe = ugraf.exe / nx.exe 才算 NX；
+       exe 已知但不是 NX（例如浏览器 chrome.exe）→ 标题再像也不提示；
+       **只有 exe 取不到（空）时**才退回标题匹配（含 NX / Designcenter）；
+    4. nx 后端没有 connected（还没找到录制日志；状态还没生成时按未连接算）。
+
+    参数：
+        current_window: (窗口标题, 程序名) 二元组，如 ("NX 2512", "ugraf.exe")
+        stream1_status: 各流1 后端 status() 组成的列表；None/空列表 = 还没状态
+        cfg: 合并后的配置 dict（DEFAULT_CONFIG + 用户 config.json）
+        data_dir: 数据根目录（可省略，仅用于拼 journal_dir）
+
+    返回 {"text": 提醒文字, "journal_dir": "<数据目录>\\journals"}。
+    """
+    cfg = cfg or {}
+    stream1 = cfg.get("stream1") or {}
+    if not stream1.get("enabled", True):
+        return None
+    backends = stream1.get("backends")
+    if backends is None:                       # 没配就按默认三个后端算
+        backends = ["solidworks", "creo", "nx"]
+    if "nx" not in [str(b).strip().lower() for b in backends]:
+        return None
+    nx_cfg = cfg.get("nx") or {}
+    if not nx_cfg.get("hint_when_not_recording", True):
+        return None
+    title, exe = (current_window or (None, None))[:2]
+    exe_l = str(exe or "").strip().lower()
+    title_l = str(title or "").lower()
+    # exe 优先（和装聋同一规则）：exe 已知时，只有 NX 主程序才算 NX；
+    # 否则标题里带 "NX" 的浏览器/搜索页会被误提示。
+    if exe_l:
+        is_nx = exe_l in NX_EXECUTABLES
+    else:
+        is_nx = ("nx" in title_l or "designcenter" in title_l)
+    if not is_nx:
+        return None
+    for st in stream1_status or []:
+        try:
+            if str(st.get("backend", "")).lower() == "nx" and st.get("connected"):
+                return None                    # 已经挂上 journal，不用再提醒
+        except AttributeError:
+            continue
+    journal_dir = nx_journal_dir(data_dir)
+    return {
+        "text": "NX 已在前台，但还没找到录制日志：请在 NX 里点 File → Utilities → "
+                "Record Journal（或设置 nx.journal_path）",
+        "journal_dir": str(journal_dir),
+    }
 
 
 class CollectorSession:
@@ -146,6 +277,8 @@ class CollectorSession:
         self.running = False
         self.started_at = None
         self.error = None
+        # 本次会话有没有写库失败（写失败时序号/计数会错位，不能当"正常空会话"删掉）
+        self._write_failed = False
         self.stream1 = None          # 第一个流1 桥（保留给笔势取文档类型用）
         self.stream1s = []           # 全部流1 桥（solidworks/creo/nx）
         self.ai_eye = None           # AI 眼（截图→云端识别），start() 里按配置创建
@@ -194,6 +327,8 @@ class CollectorSession:
             self._leave_count = 0
             self._in_leave = False
             self._ai_eye_drain = None
+            self._write_failed = False
+            self.error = None
 
             # v4：先建本次会话文件夹（重名自动 _2/_3），再在里面开库
             self.session_dir = create_session_dir(self.data_dir)
@@ -261,8 +396,13 @@ class CollectorSession:
                             )
                         elif backend == "nx":
                             from nx_bridge import NxBridge
+                            # 把**实际数据根目录**传给桥：桥的默认 journal 目录
+                            # 必须和界面【打开 NX 日志目录】按钮指向同一个
+                            # `<data_dir>\journals`（打包/自定义数据目录时也不跑偏）
+                            nx_cfg = dict(self.cfg.get("nx", {}))
+                            nx_cfg["data_dir"] = str(self.data_dir)
                             bridge = NxBridge(
-                                cfg=self.cfg.get("nx", {}),
+                                cfg=nx_cfg,
                                 on_event=lambda kind, detail: self._on_stream1_event(
                                     kind, {**detail, "backend": "nx"}),
                                 is_running=lambda: self.running,
@@ -291,6 +431,10 @@ class CollectorSession:
                             if self.running else None),
                         is_running=lambda: self.running,
                         images_dir=self.images_dir,
+                        # 截图前复核窗口身份要用它：和装聋判定同一份建模软件名单
+                        modeling_apps=self.cfg.get("modeling_apps", []),
+                        allow_all_windows=self.cfg.get("debug", {}).get(
+                            "allow_all_windows", False),
                     )
                     self.ai_eye.start()
                 except Exception as exc:
@@ -330,7 +474,10 @@ class CollectorSession:
                 self.store.close()
                 self.store = None
             self._closed = True
-            if self.session_dir is not None and self._content_events == 0:
+            # 半截会话：没有内容才删；**写库失败过也保留**（可能是库写不进去，
+            # 删了就把证据/半截数据丢了，和 stop() 的规则保持一致）
+            if (self.session_dir is not None and self._content_events == 0
+                    and not self._write_failed):
                 from collector_core import delete_session_dir
                 delete_session_dir(self.session_dir)
                 self.session_dir = None
@@ -341,7 +488,7 @@ class CollectorSession:
         """停止采集：排空 AI 眼 → 三方对账 → 写 session.json → 关库 → 空会话删除。
 
         返回本次会话小结（dict）；没在采集时返回 None。字段：
-        session_dir / kept / event_count / counts / duration_s / ai_eye。
+        session_dir / kept / status / error / event_count / counts / duration_s / ai_eye。
         """
         from collector_core import (APP_VERSION, SCHEMA_VERSION, STORAGE_VERSION,
                                     _iso_from_ms, delete_session_dir, now_iso,
@@ -401,13 +548,15 @@ class CollectorSession:
             pass
 
         # 5. 写 session.json（标配摘要：不开库就能扫；库坏了也能看）
+        #    写库失败 → status="error"（不标 completed），并把原因写进摘要/界面
+        session_status = "error" if self._write_failed else "completed"
         duration_s = round((now_ms() - self.started_at) / 1000.0, 1) if self.started_at else 0.0
         software = self._software_used()
         info = {
             "app_version": APP_VERSION,
             "storage_version": STORAGE_VERSION,
             "schema_version": SCHEMA_VERSION,
-            "status": "completed",
+            "status": session_status,
             "session_id": self.session_id,
             "session": self.session_dir.name if self.session_dir else None,
             "started_at": _iso_from_ms(self.started_at) if self.started_at else None,
@@ -420,6 +569,8 @@ class CollectorSession:
             "images": "images",
             "ai_eye": self._ai_eye_drain,
         }
+        if self._write_failed:
+            info["error"] = self.error
         try:
             write_session_json(self.session_dir, info)
         except Exception as exc:
@@ -433,13 +584,17 @@ class CollectorSession:
         self._closed = True
 
         # 7. 空会话不留痕：正常停止且除开始/停止标记外一条事件都没有 → 删整个文件夹
-        kept = self._content_events > 0
+        #    写库失败时**绝不删**：那可能正是"库写不进去"，删了就把半截数据/证据
+        #    一起丢了；状态由 session.json 的 status="error" 体现。
+        kept = self._content_events > 0 or self._write_failed
         if not kept and self.session_dir is not None:
             delete_session_dir(self.session_dir)
 
         summary = {
             "session_dir": str(self.session_dir) if self.session_dir else None,
             "kept": kept,
+            "status": session_status,
+            "error": self.error if self._write_failed else None,
             "event_count": event_count,
             "counts": dict(self._counts),
             "duration_s": duration_s,
@@ -467,6 +622,8 @@ class CollectorSession:
     def stats(self):
         """给界面读的实时数字。"""
         with self._lock:
+            stream1_status = ([b.status() for b in self.stream1s]
+                              if self.stream1s else None)
             return {
                 "running": self.running,
                 "counts": dict(self._counts),
@@ -476,7 +633,14 @@ class CollectorSession:
                 "session_dir": str(self.session_dir) if self.session_dir else None,
                 "current_window": self._current_window,
                 "in_leave": self._in_leave,
-                "stream1_status": [b.status() for b in self.stream1s] if self.stream1s else None,
+                # 写库失败原因（界面/停止小结要显示；None=本次会话一切正常）
+                "error": self.error,
+                "write_failed": self._write_failed,
+                "stream1_status": stream1_status,
+                # NX 手动录制提醒：NX 在前台但还没找到 journal 时给界面一句话
+                #（纯函数，见 nx_record_hint；配置项 nx.hint_when_not_recording 可关）
+                "nx_hint": nx_record_hint(self._current_window, stream1_status,
+                                          self.cfg, self.data_dir),
                 "ai_eye_status": self.ai_eye.status() if self.ai_eye else None,
             }
 
@@ -537,7 +701,12 @@ class CollectorSession:
                     self._in_leave = False
                 self._seq += 1
                 self.store.add_event(self.session_id, self._seq, source, kind, detail, ts)
-            except Exception:
+            except Exception as exc:
+                # 写库失败绝不能安静吞掉：记下原因 + 标记本会话写入失败。
+                # 否则序号已加、内容计数不加，停止时会被当成"空会话"删掉，
+                # 用户只会看到"本次没有记录到任何事件"，问题被掩盖。
+                self._write_failed = True
+                self.error = f"事件写库失败: {exc}"
                 return ts
             self._counts[source if source in self._counts else "meta"] += 1
             # v4 空会话判定：只看用户数据（stream1/stream2）。
@@ -554,11 +723,22 @@ class CollectorSession:
     # ---------- 内部：AI 眼触发 ----------
 
     def _maybe_ai_eye(self, kind, detail, ts, pos):
-        """决定这次事件要不要触发 AI 眼截图。"""
+        """决定这次事件要不要触发 AI 眼截图。
+
+        隐私红线（2026-10-23 全程序检查阻断项，二次复验加固）：触发时记录
+        **当前前台窗口身份**（hwnd + exe/title + 触发时刻），一起交给 AI 眼队列。
+        后台线程会**按窗口抓取画面（PrintWindow，不是整屏）**，抓取前复核这个
+        窗口还活着、还在前台、exe/title 与触发时一致，抓取后再复核一次；任何
+        一次不满足就跳过（不保存/不上传/不回调），绝不退化成整屏截图。
+
+        只有 AI 眼开着时才取窗口身份——默认关闭，零额外开销。
+        """
         if not self.ai_eye:
             return
         try:
-            self.ai_eye.trigger(kind, detail, ts, pos)
+            hwnd, title, exe = foreground_window_identity()
+            window = {"hwnd": hwnd, "title": title, "exe": exe, "ts": ts}
+            self.ai_eye.trigger(kind, detail, ts, pos, window=window)
         except Exception:
             pass
 

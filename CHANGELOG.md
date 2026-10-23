@@ -6,9 +6,24 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/) —
 `0.x` means "early, interfaces may still change".
 
-## [Unreleased]
+## [0.2.2] - 2026-10-24
 
-Portability cleanup: no machine-specific paths/versions in shipped code.
+Portability cleanup (no machine-specific paths/versions in shipped code) plus the security and
+robustness fixes from the 2026-10-23 full-program review (1 blocker + 6 high-severity items),
+followed by the 2026-10-23 second-review fixes: window-only AI Eye captures (no full-screen grab
+and crop), full feature-tree COM failure handling, live-test instance ownership, honest docs and
+self-test assertion propagation.
+
+### Added
+
+- **NX manual-recording hint + one-click journal folder.** While NX is in the foreground and
+  stream 1 has not attached a recorded journal yet, the UI shows a hint telling the user to
+  start `File → Utilities → Record Journal` (or set `nx.journal_path`); a new
+  **Open NX journal folder** button creates and opens `<data_dir>\journals`. Recording stays
+  manual on purpose: NX's recording API is in-process only (`run_journal.exe -nx` is batch
+  mode and exits when the script ends; the startup folder only reads menu files), so an
+  external process cannot make a running NX start recording. Turn the hint off with
+  `nx.hint_when_not_recording: false` in `config.json`.
 
 ### Changed
 
@@ -22,11 +37,89 @@ Portability cleanup: no machine-specific paths/versions in shipped code.
   fallback path; they now fail with a clear hint if SW is not installed.
 - `selftest_ai_eye_live.py`: default data folder comes from `resolve_data_dir()`.
 
+### Fixed
+
+- **NX journal folder is now one single source.** `input_listener` passes the real data root
+  (`<data_dir>`) to `NxBridge`; the bridge's default search folder, the NX hint's `journal_dir`
+  and the **Open NX journal folder** button all resolve through
+  `collector_core.nx_journal_dir()` → `<data_dir>\journals`. Previously the bridge searched the
+  source tree's `data\journals`, so after packaging (or with a custom data folder) the button and
+  the bridge pointed at different directories.
+- **Database write failures are no longer swallowed.** A failed `add_event` now sets
+  `self.error`, marks the session as failed, and does not count as content. `stop()` keeps the
+  session folder and writes `"status": "error"` (plus the reason) to `session.json`; it is never
+  reported as `completed` and never deleted as an empty session. The stop dialog shows the error.
+- **SolidWorks disconnects are detected and recovered across the whole snapshot.**
+  `snapshot_sw(strict=True)` separates "no active document" (a normal `None`) from a real COM
+  failure (`ComSnapshotError`), and the failure handling now covers the **entire** snapshot,
+  including the feature-tree walk: if `FirstFeature` / `GetNextFeature` / sub-feature members raise
+  mid-traversal, the partial tree is discarded instead of being diffed. The bridge marks
+  `connected: false`, releases the COM object and re-runs `GetActiveObject` on the next poll; after
+  reconnecting it re-baselines the snapshot, so no fake `documentActivated` / `featureRemoved` /
+  `featureAdded` events are emitted, and `connected` goes back to `true` once SW is reachable
+  again.
+- **Self-tests no longer swallow assertion failures.** The screenshot/capture test in
+  `selftest.py` used to treat *any* exception (including `AssertionError`) as "desktop cannot be
+  captured" and print SKIP/OK. Now only a genuine desktop-unavailable condition can be skipped;
+  range/size/invalid-handle assertions propagate and make the self-test exit non-zero. A dedicated
+  regression test feeds an invalid window rectangle through the real test function and requires the
+  assertion to be raised.
+
+### Security
+
+- **AI Eye can no longer capture the full screen or a non-CAD window (privacy blocker).**
+  A trigger records the foreground window's identity (HWND + exe/title + trigger time) and the
+  queued job carries it. The capture itself is taken **directly from that window's own drawing
+  surface with `PrintWindow`** — the full-screen grab + crop path (and its fallback) is gone
+  entirely; nothing but the target window's content ever enters the bitmap. The tool re-verifies
+  the exact window identity **before** the capture (HWND alive, still in the foreground,
+  exe/title unchanged) and **again after** it (window still there / not switched away). If either
+  check fails, the image is discarded (or never taken): nothing is saved, uploaded or written as a
+  recognition event. Invalid or minimized window rectangles are rejected before the capture
+  function is called.
+- **The NX recording hint uses the same executable-first rule as deaf mode.** A window whose
+  executable is readable but is not an NX executable (`ugraf.exe` / `nx.exe`) never triggers the
+  "record a journal" hint, even when its title contains "NX" (e.g. a browser or search tab). Title
+  matching remains only as the fallback for when the executable name cannot be read.
+- **The `AI_EYE_KEY` environment variable never touches disk.** `ConfigManager._merge()` now
+  deep-copies the defaults (a shallow copy let the runtime key pollute `DEFAULT_CONFIG`),
+  `ensure_file()` keeps writing a clean default file, and the settings dialog shows the field as
+  "from environment" (disabled) and saves the file's original `api_key` instead of the environment
+  value.
+- **Deaf mode can no longer be fooled by window titles.** A window whose executable is readable but
+  is not one of the configured CAD executables is rejected even when its title contains
+  "NX"/"SOLIDWORKS" (e.g. a browser tab about NX). Title matching remains only as a fallback for
+  the case where the executable name cannot be read at all.
+- **Live-test scripts no longer kill the user's CAD.** `selftest_nx.py`, `selftest_creo.py` and
+  `selftest_solidworks.py` only close the process they started themselves (recorded Popen PID →
+  `taskkill /PID <pid> /T /F`). The SolidWorks live test no longer calls COM `ExitApp()` at all:
+  `launched=True` cannot prove the COM instance belongs to that Popen, so `GetActiveObject` may
+  return the user's already-running instance. Without a provable ownership the script leaves every
+  instance alone. An already-running NX / Creo / SolidWorks is never touched.
+
+### Tests
+
+- `python app\selftest.py` — **34 tests**; `python app\selftest.py --ci` — **23 tests**.
+  New deterministic regression coverage: AI Eye window-only capture with pre/post identity
+  verification (foreground switch / exe-title mismatch / invalid rectangle → zero capture calls;
+  post-capture switch → image discarded; normal → only a window-sized image is saved; source
+  contains no screen-grab/crop path), `AI_EYE_KEY` runtime-only handling (no pollution,
+  `ensure_file` / settings save never persist it), NX journal-dir single source, session kept with
+  `status=error` after a write failure, SolidWorks COM disconnect/reconnect without false
+  deletions (including a mid-traversal `GetNextFeature` failure), live-test scripts only closing
+  their own Popen PID (fake COM instance proves `ExitApp` is never called), NX hint executable
+  priority (browser title containing "NX" stays silent), and an invalid capture rectangle making
+  the self-test fail instead of being skipped.
+- The end-to-end stream-2 test now degrades deterministically when the OS drops synthetic
+  keyboard input (common on restricted/secure desktops): it prints an explicit SKIP for the
+  injection leg and still verifies the hook-callback → database path.
+
 ## [0.2.1] - 2026-10-23
 
 NX stream 1 now reads the **recorded journal** instead of syslog; reconciliation no
-longer reports false anomalies when stream 1 has no data source; AI Eye uses a working
-multimodal provider by default.
+longer reports false anomalies when stream 1 has no data source; AI Eye docs and examples
+now point at working multimodal providers (the shipped `ai_eye.provider` default stays
+`mock`, i.e. no network call until you configure a key).
 
 ### Fixed
 

@@ -24,19 +24,37 @@ CREO_EXE = cad_discovery.creo_exe_path(sys.argv[1] if len(sys.argv) > 1 else Non
 WAIT_S = 240
 
 
+def close_started(proc):
+    """只关闭**本脚本自己启动**的进程（按 PID；绝不按镜像名 /IM 全杀）。
+
+    Creo 启动慢，用户很可能本来就开着 Creo 在干活：测试脚本只能关自己 Popen
+    起来的那一个进程树，否则会把用户没保存的工作一起杀掉。
+    没启动过（proc=None）→ 什么都不做。
+    """
+    if proc is None:
+        return False
+    try:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
 def main():
     if not CREO_EXE or not Path(CREO_EXE).exists():
         print("找不到 Creo 主程序 parametric.exe（未安装/未发现）。")
         print("可以手动指定：python app\\selftest_creo.py <parametric.exe 路径>")
         return 1
-    # 确认没有已在跑的 Creo
+    # 确认没有已在跑的 Creo：只有本脚本自己拉起的实例，测试结束才关
     procs = subprocess.run(["tasklist", "/FI", "IMAGENAME eq parametric.exe"],
                            capture_output=True, text=True).stdout
-    launched = False
+    launched_proc = None
     if "parametric.exe" not in procs.lower():
-        subprocess.Popen([CREO_EXE], cwd=str(Path(CREO_EXE).parent))
-        launched = True
-        print("已启动 Creo Parametric（测试结束会关闭）…")
+        launched_proc = subprocess.Popen([CREO_EXE], cwd=str(Path(CREO_EXE).parent))
+        print("已启动 Creo Parametric（本次脚本启动，测试结束只关自己拉起的进程）…")
+    else:
+        print("Creo 已在运行（测试结束不会关闭它）")
 
     tmp = tempfile.mkdtemp(prefix="cad-ai-creo-")
     with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
@@ -70,10 +88,11 @@ def main():
         time.sleep(15)
     finally:
         session.stop()
-        # 测试工具：结束后关掉 Creo（测试前确认过本机没有 Creo 在跑）
-        subprocess.run(["taskkill", "/F", "/IM", "parametric.exe"],
-                       capture_output=True)
-        print("已关闭 Creo")
+        # 测试工具：只关自己启动的 Creo（用户原本开着的实例一律不动）
+        if close_started(launched_proc):
+            print("已关闭本次脚本启动的 Creo")
+        else:
+            print("Creo 原本就在运行 → 保持打开（不会关掉你自己的实例）")
 
     events = session.store.query_session(session.session_id)
     creo_events = [e for e in events if e["source"] == "stream1"]

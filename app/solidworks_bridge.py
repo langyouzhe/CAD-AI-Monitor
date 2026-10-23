@@ -12,6 +12,12 @@ solidworks_bridge.py —— 流1 桥：把 SolidWorks 里的变化接进采集�
 设计约定：
 - 默认只"连接已经打开的 SolidWorks"（allow_launch=false），绝不擅自把 SW 拉起来；
 - 所有 COM 调用都包了保护：SW 卡住/退出都不会带崩采集器；
+- **断线要能看出来**：`snapshot_sw(strict=True)` 把"没有活动文档"（正常 None）和
+  "COM 异常"（抛 ComSnapshotError）分开；而且异常判定覆盖**整棵快照**——
+  活动文档、选中、特征树遍历（GetNextFeature/子特征）中途任何一次 COM 读取失败
+  都算断线。桥遇到 COM 异常会标 connected=False、释放 COM 对象、下一轮重新
+  GetActiveObject；重连后先抓基准再比对，**绝不用不完整快照去 diff**
+  （否则会产出假的文档/特征删除事件）；
 - 比对逻辑（diff_snapshot）是纯函数，不依赖 SW，可以单独做单元测试。
 """
 import threading
@@ -23,17 +29,84 @@ import cad_discovery
 MAX_FEATURES = 1500
 MAX_DEPTH = 6
 
+# "没有这个成员"类错误：SW 各版本/各文档类型成员不完全一致，这种不算断线
+_MEMBER_MISSING_MARKERS = ("-2147352573", "Member not found", "找不到成员",
+                           "does not support", "不支持")
 
-def _get_com_member(obj, name, *args, default=None):
+# 可选成员（如选中面的 Name）"没有这个名字"类错误：pywin32 有时抛
+# AttributeError("IFace2.Name")，有时抛 DISP_E_UNKNOWNNAME。都属正常缺失。
+_UNKNOWN_NAME_MARKERS = ("-2147352570", "DISP_E_UNKNOWNNAME",
+                         "Unknown name", "unknown name", "未知名称")
+
+
+class ComSnapshotError(RuntimeError):
+    """SolidWorks COM 读取失败（SW 被关掉 / 卡死 / 拒绝调用）。
+
+    用途：抓拍时区分"**没有打开文档**（正常 None）"和"**COM 断线**（异常）"。
+    以前所有异常都被吞成空快照 → 桥以为文档/特征全没了，会产出假的
+    documentActivated / featureRemoved 删除事件，而且一直握着失效的 COM 对象
+    不重连。现在异常往上抛，桥据此断开、释放对象、下一轮重新 GetActiveObject。
+    """
+
+
+def _is_member_missing(exc):
+    """这个异常是不是"该版本没有这个成员"（正常，不该当成断线）。"""
+    msg = str(exc)
+    return any(m in msg for m in _MEMBER_MISSING_MARKERS)
+
+
+def _is_optional_member_missing(exc):
+    """可选成员（选中对象的 Name 等）是不是"本来就没有这个成员"。
+
+    第三个复验的阻断点：pywin32 对不存在的 dispatch 成员会抛
+    `AttributeError("IFace2.Name")`。面/边不保证有 Name，strict 快照把它当
+    COM 断线 → connected=False、持续重试、丢采集。这里只对**可选成员**放宽；
+    必选成员的读取路径不变（失败仍按断线处理）。
+    """
+    if isinstance(exc, AttributeError):
+        return True
+    msg = str(exc)
+    return (any(m in msg for m in _MEMBER_MISSING_MARKERS)
+            or any(m in msg for m in _UNKNOWN_NAME_MARKERS))
+
+
+def _is_com_dispatch(obj):
+    """pywin32 动态 COM 对象（属性值本身），不是普通 Python 方法。
+
+    这类对象可调用（默认成员），但被当函数调会报 "Member not found"——
+    这是属性，不是断线。只对它放行；普通方法（GetTitle/GetSuppression2 等）
+    调用失败必须按断线处理，否则会吞掉真实 COM 故障、产生假变化事件。
+    """
+    return hasattr(obj, "_oleobj_") or type(obj).__name__ in (
+        "CDispatch", "Dispatch", "PyIDispatch", "PyIDispatchEx")
+
+
+def _get_com_member(obj, name, *args, default=None, strict=False, optional=False):
     """安全读取 SW 的 COM 成员（参考 solidworks-automation-skill 的写法）。
 
     SW 的类型库把很多 GetXxx 声明成"属性"，pywin32 取属性时会自动取值；
-    有些又是普通方法。这个函数两者通吃，而且绝不抛异常（桥不能因为
-    一个成员读不到就崩）。
+    有些又是普通方法。这个函数两者通吃。
+
+    strict=False（默认）：任何异常都返回 default，绝不抛（联调脚本/宽松探测用）。
+    strict=True：真正的 COM 异常往上抛 ComSnapshotError，
+                 让桥知道断线了；快照里的**每个必选成员**读取（含特征树遍历）都用它。
+    optional=True：这是可选成员（如选中对象的 Name）。getattr/调用遇到
+                 AttributeError / DISP_E_UNKNOWNNAME / DISP_E_MEMBERNOTFOUND 类
+                 "没这个成员"→ 返回 default（通常是 None），快照继续有效。
+    **必选成员（optional=False）在 strict 下任何 getattr 异常都必须抛
+    ComSnapshotError**，包括 DISP_E_MEMBERNOTFOUND（"Member not found"）——
+    否则快照会悄悄变空、connected 仍 True，产生假的 documentActivated(cur=None)。
+    只有**调用路径**保留旧的"伪可调用属性"语义（把属性值本身交出去）。
     """
     try:
         member = getattr(obj, name)
-    except Exception:
+    except Exception as exc:
+        # getattr 路径：只有可选成员允许"没这个成员"豁免；必选成员任何异常
+        # （含 Member not found）在 strict 下都算断线，绝不能吞成空快照。
+        if optional and _is_optional_member_missing(exc):
+            return default
+        if strict:
+            raise ComSnapshotError(f"读取 {name} 失败: {exc}") from exc
         return default
     try:
         if args:
@@ -41,10 +114,17 @@ def _get_com_member(obj, name, *args, default=None):
         return member() if callable(member) else member
     except Exception as exc:
         msg = str(exc)
-        # "伪可调用属性"（例如返回 COM 对象的属性）被当函数调会报找不到成员，
-        # 这种情况下直接把属性值本身交出去。
-        if "-2147352573" in msg or "Member not found" in msg or "找不到成员" in msg:
+        # "伪可调用属性"：getattr 拿到的是 pywin32 的 COM dispatch 对象，
+        # 被当函数调用时报 "Member not found"——这不是断线，直接把属性值
+        # 交出去。**只对真正的 COM 对象放行**；普通方法调用失败（即使报
+        # Member not found）在 strict 下必须按断线处理，否则会吞掉真实
+        # COM 故障并产生假变化事件。
+        if _is_member_missing(exc) and _is_com_dispatch(member):
             return member
+        if optional and _is_optional_member_missing(exc):
+            return default
+        if strict:
+            raise ComSnapshotError(f"读取 {name} 失败: {exc}") from exc
         return default
 
 
@@ -53,7 +133,12 @@ def _get_com_member(obj, name, *args, default=None):
 def diff_snapshot(prev, cur):
     """比对两次抓拍，生成事件列表。每项形如
     {"event_type": "...", ...payload...}，不含 event_type 的字段都是 payload。
+
+    注意：断线时**不要**拿空快照来比（会产生假的删除事件）——桥那边遇到
+    COM 异常会直接断开重连，重新连上后先抓基准快照再比对。
     """
+    prev = prev or {}
+    cur = cur or {}
     events = []
 
     # 1. 活动文档变了（打开/切换/关闭）
@@ -107,76 +192,80 @@ def diff_snapshot(prev, cur):
 
 # ---------- SolidWorks COM 抓拍 ----------
 
-def snapshot_sw(sw):
+def snapshot_sw(sw, strict=False):
     """对 SolidWorks 当前状态做一次抓拍。
 
     返回 {"doc": {...}|None, "selection": [...], "features": [...]}
-    任何一步失败都只留空/跳过，绝不抛异常。
+
+    strict=False（默认，给联调脚本用）：任何一步失败都只留空/跳过，绝不抛异常。
+    strict=True（给桥的轮询用）：**整棵快照（活动文档 / 选中 / 特征树遍历）**
+        任何 COM 读取失败都抛 ComSnapshotError。特征遍历中途 GetNextFeature /
+        GetNextSubFeature / Name 等读取失败不能再吞成"特征没了"——那会让桥用
+        不完整快照差分，产出假的 featureRemoved/featureAdded，而且一直握着
+        失效的 COM 对象不重连。
+        **"没有活动文档"仍然是正常的 doc=None，不算异常**——区分开这两者，
+        桥才能做到"没文档不误报、断线要重连"。
     """
     snap = {"doc": None, "selection": [], "features": []}
-    model = _get_com_member(sw, "ActiveDoc")
+    model = _get_com_member(sw, "ActiveDoc", strict=strict)
     if model is None:
         return snap
 
     # 活动文档
-    title = _get_com_member(model, "GetTitle")
-    doc_type = _get_com_member(model, "GetType")  # 1=零件 2=装配体 3=工程图
+    title = _get_com_member(model, "GetTitle", strict=strict)
+    doc_type = _get_com_member(model, "GetType", strict=strict)  # 1=零件 2=装配体 3=工程图
     if title is not None or doc_type is not None:
         snap["doc"] = {"title": title, "type": doc_type}
 
     # 选中状态（面/边/特征的"模型引用"）
     # 注意：SW 的类型库把 ISelectionManager 标成只写属性，必须用不带 I 前缀的
     # SelectionManager（IExtension 同理，要用 Extension）。
-    sel_mgr = _get_com_member(model, "SelectionManager")
+    sel_mgr = _get_com_member(model, "SelectionManager", strict=strict)
     if sel_mgr is not None:
-        try:
-            count = _get_com_member(sel_mgr, "GetSelectedObjectCount2", -1) or 0
-            items = []
-            for i in range(1, int(count) + 1):
-                obj = _get_com_member(sel_mgr, "GetSelectedObject6", i, -1)
-                name = _get_com_member(obj, "Name") if obj is not None else None
-                otype = _get_com_member(sel_mgr, "GetSelectedObjectType3", i, -1)
-                items.append({"type": int(otype) if otype is not None else None,
-                              "name": name})
-            snap["selection"] = items
-        except Exception:
-            pass
+        count = _get_com_member(sel_mgr, "GetSelectedObjectCount2", -1,
+                                strict=strict) or 0
+        items = []
+        for i in range(1, int(count) + 1):
+            obj = _get_com_member(sel_mgr, "GetSelectedObject6", i, -1,
+                                  strict=strict)
+            # 面/边等选中对象不保证有 Name（pywin32 会抛 AttributeError）：
+            # 这是正常缺成员 → name=None，快照继续有效，不能当 COM 断线。
+            name = (_get_com_member(obj, "Name", strict=strict, optional=True)
+                    if obj is not None else None)
+            otype = _get_com_member(sel_mgr, "GetSelectedObjectType3", i, -1,
+                                    strict=strict)
+            items.append({"type": int(otype) if otype is not None else None,
+                          "name": name})
+        snap["selection"] = items
 
-    # 特征树（BFS 遍历，带上限；用（名字,类型）去重，防 SW 子特征自引用死循环）
+    # 特征树（BFS 遍历，带上限；用（名字,类型）去重，防 SW 子特征自引用死循环）。
+    # strict=True 时这里**不再**吞异常：任何 COM 读取失败都让整次抓拍作废，
+    # 由桥断开重连、重建基准——绝不用残缺特征树去差分。
     feats = []
     seen = set()
-    try:
-        feat = _get_com_member(model, "FirstFeature")
-        stack = [(feat, "", 0)]
-        while stack and len(feats) < MAX_FEATURES:
-            f, path, depth = stack.pop()
-            if f is None or depth > MAX_DEPTH:
-                continue
-            name = _get_com_member(f, "Name")
-            ftype = _get_com_member(f, "GetTypeName2")
-            sup = _get_com_member(f, "GetSuppression2")
-            # SW 的 GetFirstSubFeature 在"没有子特征"时会返回自身/父特征，
-            # 之前会拍出 凸台-拉伸1/凸台-拉伸1/凸台-拉伸1/... 几十层垃圾路径。
-            key = (name, ftype)
-            if key in seen:
-                continue
-            seen.add(key)
-            full_path = (path + "/" + name) if (path and name) else (name or path)
-            feats.append({"path": full_path, "type": ftype, "sup": sup})
-            try:
-                sub = _get_com_member(f, "GetFirstSubFeature")
-                while sub is not None:
-                    stack.append((sub, full_path, depth + 1))
-                    sub = _get_com_member(sub, "GetNextSubFeature")
-            except Exception:
-                pass
-            try:
-                feat = _get_com_member(f, "GetNextFeature")
-                stack.append((feat, path, depth))
-            except Exception:
-                pass
-    except Exception:
-        pass
+    feat = _get_com_member(model, "FirstFeature", strict=strict)
+    stack = [(feat, "", 0)]
+    while stack and len(feats) < MAX_FEATURES:
+        f, path, depth = stack.pop()
+        if f is None or depth > MAX_DEPTH:
+            continue
+        name = _get_com_member(f, "Name", strict=strict)
+        ftype = _get_com_member(f, "GetTypeName2", strict=strict)
+        sup = _get_com_member(f, "GetSuppression2", strict=strict)
+        # SW 的 GetFirstSubFeature 在"没有子特征"时会返回自身/父特征，
+        # 之前会拍出 凸台-拉伸1/凸台-拉伸1/凸台-拉伸1/... 几十层垃圾路径。
+        key = (name, ftype)
+        if key in seen:
+            continue
+        seen.add(key)
+        full_path = (path + "/" + name) if (path and name) else (name or path)
+        feats.append({"path": full_path, "type": ftype, "sup": sup})
+        sub = _get_com_member(f, "GetFirstSubFeature", strict=strict)
+        while sub is not None:
+            stack.append((sub, full_path, depth + 1))
+            sub = _get_com_member(sub, "GetNextSubFeature", strict=strict)
+        next_feat = _get_com_member(f, "GetNextFeature", strict=strict)
+        stack.append((next_feat, path, depth))
     snap["features"] = feats
     return snap
 
@@ -215,6 +304,7 @@ class SolidWorksBridge:
             "last_error": None,
             "retrying": False,
         }
+        self._prev = None        # 上一次抓拍（连上后先抓基准；断开时清空）
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -246,42 +336,73 @@ class SolidWorksBridge:
         sw = None
         try:
             while not self._stop.is_set():
-                # 1) 确保连接
+                was_connected = sw is not None
+                sw = self._tick(sw, win32com.client)
                 if sw is None:
-                    sw = self._connect(win32com.client)
-                    if sw is None:
-                        self._set_state(connected=False, retrying=True)
-                        self._stop.wait(5)  # 连不上就等 5 秒再试
-                        continue
-                    self._set_state(connected=True, retrying=False, last_error=None)
-                    doc = _get_com_member(sw, "ActiveDoc")
-                    title = _get_com_member(doc, "GetTitle") if doc is not None else None
-                    self._set_state(doc=title)
-                    # 先抓拍一次做基准，不算变化
-                    self._prev = snapshot_sw(sw)
+                    # 连不上 / 刚断开：等 5 秒再重试（不刷屏、不抢 CPU）
+                    self._stop.wait(5)
+                elif not was_connected:
+                    # 刚连上（已抓基准快照）：马上进入正常轮询，不再等
                     continue
-
-                # 2) 已连接：抓拍 → 比对 → 回调
-                try:
-                    cur = snapshot_sw(sw)
-                    for ev in diff_snapshot(self._prev, cur):
-                        event_type = ev.pop("event_type")
-                        self.on_event(event_type, ev)
-                    self._prev = cur
-                    doc = cur.get("doc") or {}
-                    self._set_state(doc=doc.get("title"), doc_type=doc.get("type"))
-                except Exception as exc:
-                    # SW 被关掉或卡死 → 断开，走重连
-                    self._set_state(connected=False, last_error=str(exc), doc=None, doc_type=None)
-                    sw = None
-                self._stop.wait(self.poll_s)
+                else:
+                    self._stop.wait(self.poll_s)
         finally:
-            if sw is not None:
-                try:
-                    sw = None
-                except Exception:
-                    pass
+            sw = None          # 释放 COM 引用（进程退出/停采时不再握着失效对象）
             pythoncom.CoUninitialize()
+
+    def _tick(self, sw, win32com_client=None):
+        """一轮：确保连接 → 抓拍 → 比对 → 回调。返回当前 COM 对象。
+
+        返回 None = 当前未连接（连不上或刚断开），下一轮会重新 GetActiveObject。
+        **可直接单测**：注入假 COM 对象 + 覆盖 _connect 就能验证断线重连，
+        不需要真的装 SolidWorks。
+        """
+        # 1) 确保连接
+        if sw is None:
+            if win32com_client is None:
+                import win32com.client as win32com_client
+            sw = self._connect(win32com_client)
+            if sw is None:
+                self._set_state(connected=False, retrying=True)
+                return None
+            # 先抓拍一次做基准，不算变化
+            try:
+                baseline = snapshot_sw(sw, strict=True)
+            except Exception as exc:
+                # 刚连上就读不到（SW 还没就绪）→ 当作没连上，稍后重试
+                self._set_state(connected=False, retrying=True,
+                                last_error=f"连接后抓拍失败，稍后重试: {exc}",
+                                doc=None, doc_type=None)
+                return None
+            doc = baseline.get("doc") or {}
+            self._set_state(connected=True, retrying=False, last_error=None,
+                            doc=doc.get("title"), doc_type=doc.get("type"))
+            self._prev = baseline
+            return sw
+
+        # 2) 已连接：抓拍 → 比对 → 回调
+        try:
+            cur = snapshot_sw(sw, strict=True)
+        except Exception as exc:
+            # COM 异常 = SW 被关掉/卡死，不是"文档被删了"。
+            # 关键：绝不用空快照去 diff（否则会产出假的文档/特征删除事件）；
+            # 直接标记断开、释放 COM 对象，下一轮重新 GetActiveObject。
+            self._set_state(connected=False, retrying=True,
+                            last_error=f"SolidWorks COM 读取失败，已断开重连: {exc}",
+                            doc=None, doc_type=None)
+            self._prev = None
+            return None
+        try:
+            for ev in diff_snapshot(self._prev, cur):
+                event_type = ev.pop("event_type")
+                self.on_event(event_type, ev)
+            self._prev = cur
+            doc = cur.get("doc") or {}
+            self._set_state(doc=doc.get("title"), doc_type=doc.get("type"))
+        except Exception as exc:
+            # 回调/比对出错不算 SW 断线（别误重连），只记录原因
+            self._set_state(last_error=f"事件处理失败: {exc}")
+        return sw
 
     def _connect(self, win32com_client):
         """连接 SolidWorks：先找已经开着的，找不到才按配置决定要不要自己启动。

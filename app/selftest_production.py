@@ -12,6 +12,10 @@ selftest_production.py —— 生产配置全流程试运行（“能不能用�
 
 判定：流1 有 documentActivated/featureAdded/selectionChanged、
 流2 有 key_down/gesture（含方向）、对账标出缺票异常 → 能用。
+
+**关闭规则**：只关闭**本脚本自己 Popen 的进程树**（taskkill /PID <pid> /T /F），
+**绝不调用 COM `ExitApp()`**——GetActiveObject 可能拿到用户原本开着的 SW 实例；
+无法证明归属（没有自己 Popen 的 PID）→ 什么都不动。
 """
 import ctypes
 import json
@@ -24,18 +28,31 @@ from pathlib import Path
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import pythoncom  # noqa: E402
-import win32com.client  # noqa: E402
-
+# COM / CAD 发现都**延迟导入**：本文件被自检当模块导入做行为测试时，
+# 不要求机器上装了 pywin32/SolidWorks（CI 也能 import）。
 from collector_core import DEFAULT_CONFIG  # noqa: E402
 from input_listener import CollectorSession  # noqa: E402
-import cad_discovery  # noqa: E402
 
-# 不限版本：自动发现本机装的是哪版 SW（SldWorks.Application 优先，再按版本倒序）
-PROG_IDS = cad_discovery.sw_progids()
-SW_EXE = cad_discovery.sw_exe_path() or ""   # 自动发现，不写死路径
 PLANE_NAMES = ["Front Plane", "前视基准面"]
 PLANE_NAMES2 = ["Top Plane", "上视基准面"]
+
+
+def _prog_ids():
+    """SolidWorks COM 名（不限版本，自动发现，不写死）。"""
+    import cad_discovery
+    return cad_discovery.sw_progids()
+
+
+def _sw_exe():
+    """SolidWorks 主程序路径（找不到返回空串）。"""
+    import cad_discovery
+    return cad_discovery.sw_exe_path() or ""
+
+
+def _win32com():
+    """延迟导入 win32com.client（方便自检用假对象替换）。"""
+    import win32com.client
+    return win32com.client
 
 
 def send_key(scan, up=False):
@@ -63,32 +80,82 @@ def real_gesture():
     legacy_mouse(0, 0, MOUSEEVENTF_RIGHTUP)
 
 
+def close_started(proc):
+    """只关闭**本脚本自己启动**的进程（按 PID；绝不按镜像名 /IM 全杀）。
+
+    没启动过（proc=None）→ 什么都不做。
+    """
+    if proc is None:
+        return False
+    try:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
+def cleanup_after_test(sw, launched_proc):
+    """测试收尾：**只按 PID 关闭自己 Popen 的进程树，不碰 COM 实例**。
+
+    为什么不调用 `sw.ExitApp()`：`launched` 只说明"我们启动过一个进程"，
+    并不能证明 COM 实例就属于它——Popen 之后 GetActiveObject 完全可能拿到
+    用户原本就开着的 SW 实例。ExitApp 会关掉用户没保存的模型。
+    归属无法证明（launched_proc=None）→ **什么都不动**。
+    """
+    if launched_proc is not None:
+        closed = close_started(launched_proc)
+        if closed:
+            print("已按 PID 关闭本次脚本启动的 SolidWorks 进程树"
+                  f"（PID={launched_proc.pid}，未调用 COM ExitApp）")
+        else:
+            print(f"关闭本次脚本启动的 SolidWorks 失败（PID={launched_proc.pid}），"
+                  "请手动检查")
+        return closed
+    if sw is not None:
+        print("SolidWorks 原本就在运行 → 保持打开（不会关掉你自己的实例）")
+    else:
+        print("未连接 SolidWorks（本脚本没有关闭任何实例）")
+    return False
+
+
 def connect_sw():
-    for pid in PROG_IDS:
+    """连接 SW；没开就正常启动一个。
+
+    返回 (sw, launched_proc)：
+    - launched_proc=Popen 对象 → 这个进程是**本脚本启动**的，收尾按 PID 关；
+    - launched_proc=None → 用户原本就开着（**绝不能关**）。
+      即使我们自己 Popen 过，GetActiveObject 也可能先拿到用户原实例；
+      关闭只认"我们 Popen 的 PID"，绝不按 COM 实例关。
+    """
+    win32com_client = _win32com()
+    prog_ids = _prog_ids()
+    sw_exe = _sw_exe()
+    for pid in prog_ids:
         try:
-            sw = win32com.client.GetActiveObject(pid)
+            sw = win32com_client.GetActiveObject(pid)
             print(f"已连接运行中的 SolidWorks（ProgID={pid}）")
-            return sw, False
+            return sw, None
         except Exception:
             continue
-    if not SW_EXE or not Path(SW_EXE).is_file():
+    if not sw_exe or not Path(sw_exe).is_file():
         raise RuntimeError("找不到 SolidWorks 主程序（未安装？）——请先手动启动 SW 再重试")
-    subprocess.Popen([SW_EXE])
-    launched = True
-    print("已正常启动 SolidWorks…等待就绪")
+    launched_proc = subprocess.Popen([sw_exe])
+    print("已正常启动 SolidWorks（本次脚本启动，测完只按 PID 关它）…等待就绪")
     sw = None
     deadline = time.monotonic() + 300
     while sw is None and time.monotonic() < deadline:
         time.sleep(5)
-        for pid in PROG_IDS:
+        for pid in prog_ids:
             try:
-                sw = win32com.client.GetActiveObject(pid)
+                sw = win32com_client.GetActiveObject(pid)
                 break
             except Exception:
                 continue
     if sw is None:
+        close_started(launched_proc)      # 只关自己 Popen 的进程树
         raise RuntimeError("SW 启动超时")
-    return sw, launched
+    return sw, launched_proc
 
 
 def foreground_sw(sw):
@@ -170,6 +237,9 @@ def new_part_with_retry(sw):
 
 def build_part(sw):
     """真实建模 + 换选（中文/英文基准面名都兼容）。"""
+    import pythoncom
+    import win32com.client
+
     model = new_part_with_retry(sw)
     time.sleep(1.5)
     empty = win32com.client.VARIANT(pythoncom.VT_DISPATCH, None)
@@ -196,9 +266,13 @@ def build_part(sw):
 
 
 def main():
+    import pythoncom
+
     pythoncom.CoInitialize()
-    sw, launched = connect_sw()
+    launched_proc = None
+    sw = None
     try:
+        sw, launched_proc = connect_sw()
         foreground_sw(sw)
         tmp = tempfile.mkdtemp(prefix="cad-ai-prod-")
         # 生产默认配置：装聋开、调试豁免关（真实环境长这样）
@@ -260,12 +334,9 @@ def main():
             print(f"  - {a['detail']['type']}: {a['detail']['reason'][:60]}")
         return 0 if all(checks.values()) else 1
     finally:
-        if launched:
-            try:
-                sw.ExitApp()
-                print("\n已关闭 SolidWorks")
-            except Exception:
-                pass
+        # 收尾：只按 PID 关本脚本自己 Popen 的进程树；**不调用 COM ExitApp**
+        # （launched 不能证明 COM 实例归属，ExitApp 可能关掉用户原实例）。
+        cleanup_after_test(sw, launched_proc)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,9 @@ selftest_nx.py —— NX 真机联调（2026-10-23 改为 Journal 数据源）
    把 journal 保存到 桌面 / 文档 / data\\journals（任选，桥会自动找最新）；
 2. 运行本脚本（不需要手动开 NX，脚本会拉起；若 NX 已开则直接用）；
 3. 在 NX 里做几个操作（画草图/拉伸），回来看事件计数。
+
+**关闭规则**：脚本只关闭**自己 Popen 起来**的 NX 进程树（按 PID）；
+你原本就开着的 NX 一律不动（避免把没保存的工作杀掉）。
 """
 import json
 import os
@@ -29,6 +32,23 @@ import cad_discovery  # noqa: E402
 from input_listener import CollectorSession  # noqa: E402
 
 WAIT_S = 300
+
+
+def close_started(proc):
+    """只关闭**本脚本自己启动**的进程（按 PID；绝不按镜像名 /IM 全杀）。
+
+    NX 启动慢，用户很可能本来就开着 NX 在干活：测试脚本只能关自己 Popen
+    起来的那一个进程树，否则会把用户没保存的工作一起杀掉。
+    没启动过（proc=None）→ 什么都不做。
+    """
+    if proc is None:
+        return False
+    try:
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       capture_output=True)
+        return True
+    except Exception:
+        return False
 
 
 def journal_dirs():
@@ -70,11 +90,12 @@ def main():
 
     procs = subprocess.run(["tasklist", "/FI", "IMAGENAME eq ugraf.exe"],
                            capture_output=True, text=True).stdout
+    launched_proc = None
     if "ugraf.exe" not in procs.lower():
-        subprocess.Popen([nx_exe], cwd=str(Path(nx_exe).parent))
-        print("已启动 NX（测试结束会关闭）…")
+        launched_proc = subprocess.Popen([nx_exe], cwd=str(Path(nx_exe).parent))
+        print("已启动 NX（本次脚本启动，测试结束只关自己拉起的进程）…")
     else:
-        print("NX 已在运行")
+        print("NX 已在运行（测试结束不会关闭它）")
 
     # 等 NX 进程内存起来（说明主程序已加载）
     deadline = time.monotonic() + WAIT_S
@@ -93,7 +114,7 @@ def main():
         time.sleep(5)
     else:
         print("NX 启动超时（可能许可弹窗卡住）")
-        subprocess.run(["taskkill", "/F", "/IM", "ugraf.exe"], capture_output=True)
+        close_started(launched_proc)   # 只关自己启动的；用户原本的 NX 不动
         return 1
 
     dirs = journal_dirs()
@@ -132,8 +153,10 @@ def main():
         time.sleep(10)
     finally:
         session.stop()
-        subprocess.run(["taskkill", "/F", "/IM", "ugraf.exe"], capture_output=True)
-        print("已关闭 NX")
+        if close_started(launched_proc):
+            print("已关闭本次脚本启动的 NX")
+        else:
+            print("NX 原本就在运行 → 保持打开（不会关掉你自己的 NX）")
 
     events = session.store.query_session(session.session_id)
     nx_events = [e for e in events if e["source"] == "stream1"]

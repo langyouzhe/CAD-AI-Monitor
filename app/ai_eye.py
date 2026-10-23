@@ -3,8 +3,14 @@
 ai_eye.py —— AI 眼模块（v2.x，实现文档「v3 规格」的视觉维度）
 
 按 2026-10-11 定案的 v3 规格：
-1. 触发：点击 / 选中特征变化 / 快捷键 / 笔势 发生时，截**整个建模窗口**一张图
-   （悬停触发、视频片段：后续可选项，暂不做）；
+1. 触发：点击 / 选中特征变化 / 快捷键 / 笔势 发生时，截**触发时那一个建模窗口**
+   一张图（悬停触发、视频片段：后续可选项，暂不做）；
+   **隐私红线（2026-10-23 全程序检查阻断项，2026-10-23 二次复验加固）**：
+   触发时记录窗口身份（hwnd + exe/title + 触发时刻）；**抓取时用 Windows
+   PrintWindow 直接取该窗口自己的画面**（不再整屏 grab 再裁剪，也没有整屏
+   兜底）。抓取前复核：hwnd 存活、仍在前台、exe/title 与触发时一致；抓取后
+   **再复核一次**（窗口仍在/没被切走），任何一次不通过都跳过并丢弃图片——
+   不保存、不上传、不写识别结果。窗口最小化/矩形无效在抓取前就拒绝。
 2. 解读：BYOK——设置里填 api_base / api_key / model（OpenAI 兼容），送云端
    多模态模型，返回一句话结论（点了什么 / 界面状态 / 有无报错），按时间戳
    与流1 事件配对落库；
@@ -17,6 +23,7 @@ ai_eye.py —— AI 眼模块（v2.x，实现文档「v3 规格」的视觉维�
 6. 原则：视觉不做数值判断（见文档 5.2）。
 """
 import base64
+import ctypes
 import io
 import json
 import queue
@@ -41,23 +48,23 @@ PROMPT = (
 )
 
 
-def _virtual_screen_rect():
-    """虚拟屏幕矩形（覆盖所有显示器，左上角可能是负坐标）。"""
-    try:
-        import win32api
-        # 76=X 起点 77=Y 起点 78=宽 79=高（虚拟屏幕 = 所有显示器合起来的大矩形）
-        return (win32api.GetSystemMetrics(76), win32api.GetSystemMetrics(77),
-                win32api.GetSystemMetrics(78), win32api.GetSystemMetrics(79))
-    except Exception:
-        return (0, 0, 1920, 1080)  # 兜底：主屏分辨率
+# 按窗口抓取位图的最小合法尺寸（更小 = 最小化/异常窗口，抓取前就拒绝）
+MIN_CAPTURE_SIZE = 50
+
+# 明显是坏值（异常矩形/内存攻击）的尺寸上限：超过就不抓
+MAX_CAPTURE_SIZE = 100000
+
+# PrintWindow 的"渲染完整内容"标志（Win10+ 才认；失败后回退老式调用）
+PW_RENDERFULLCONTENT = 0x00000002
 
 
 def _screen_scale():
     """逻辑坐标 → 物理像素的换算系数（本程序是 DPI 不感知进程）。
 
-    为什么不按"窗口所在显示器"的 DPI 算：DPI 不感知进程看到的是被 Windows
-    按**系统 DPI（主显示器）**统一缩放过的整个虚拟桌面。用系统 DPI 才和
-    GetWindowRect / GetSystemMetrics 的读数一致。
+    为什么还要它：GetWindowRect 在 DPI 不感知进程里返回**被系统缩放过的逻辑
+    尺寸**，而 PrintWindow 把窗口自己的内容渲染进我们给的位图。按物理像素开
+    位图，DPI 感知的目标窗口才不会只画左上角（多出来的部分顶多是黑边，不会
+    丢内容）。用系统 DPI：和 GetWindowRect 的读数同源。
     （例：150% 缩放时，2560 宽的屏幕在本进程里只报 1707 宽。）
     """
     try:
@@ -70,24 +77,181 @@ def _screen_scale():
     return 1.0
 
 
-def _virtual_origin_physical():
-    """截图（all_screens=True）坐标系原点在真实桌面里的位置（物理像素）。
+class CaptureSkipped(Exception):
+    """截图任务被跳过：窗口身份复核没通过，或窗口框无效/抓取失败。
 
-    多显示器时虚拟桌面左上角可能是负坐标（副屏在主屏左/上方），
-    裁剪前要减掉这个原点。
+    语义：**不抓取、不保存、不上传、不写识别结果、不算识别失败**。
+    只是把原因记到状态里给用户看（"宁可不截图，也绝不截错窗口"）。
+    """
+
+
+class WindowCaptureUnavailable(RuntimeError):
+    """拿不到窗口画面（窗口句柄无效/系统拒绝），但这不是程序 bug。
+
+    单独一类的原因：自检要把"明确的抓屏系统错误"归为环境不可用（SKIP），
+    而 ValueError/MemoryError/RuntimeError 等程序错误必须让自检失败。
+    """
+
+
+def window_capture_size(rect, scale=1.0):
+    """纯函数：窗口矩形（逻辑坐标）→ 按窗口抓取位图的像素尺寸 (w, h)。
+
+    只做"这个窗口现在能不能抓"的判定：矩形必须能解包，宽高 ≥
+    MIN_CAPTURE_SIZE（更小 = 最小化/异常）。无效矩形 → None，调用方
+    **必须在抓取前就拒绝**——绝不允许先抓整屏再裁。
+
+    这里不涉及任何屏幕坐标/裁剪：抓的是窗口自己的内容，只按窗口尺寸开位图。
+    可单测，不需要真实屏幕。
     """
     try:
-        import win32api
-        s = _screen_scale()
-        return (win32api.GetSystemMetrics(76) * s, win32api.GetSystemMetrics(77) * s)
+        left, top, right, bottom = rect
+        width = int(round((float(right) - float(left)) * float(scale)))
+        height = int(round((float(bottom) - float(top)) * float(scale)))
     except Exception:
-        return (0.0, 0.0)
+        return None
+    if width < MIN_CAPTURE_SIZE or height < MIN_CAPTURE_SIZE:
+        return None
+    if width > MAX_CAPTURE_SIZE or height > MAX_CAPTURE_SIZE:
+        return None
+    return (width, height)
+
+
+def _grab_window_content(hwnd, size):
+    """默认窗口抓取器：Windows PrintWindow 把**该窗口自己的内容**画进位图。
+
+    隐私红线：这里从头到尾没有屏幕截图，也没有"先截整屏再裁剪"的路径；
+    拿不到窗口画面就抛异常，由调用方跳过该任务（不保存、不上传）。
+    顺序：PrintWindow(PW_RENDERFULLCONTENT) → PrintWindow(0) → 窗口 DC BitBlt
+    （最后一种仍是"按窗口取画面"，取的是窗口 DC，不是屏幕 DC）。
+    """
+    from PIL import Image
+    import win32gui
+    import win32ui
+    import win32con
+
+    w, h = int(size[0]), int(size[1])
+    if w <= 0 or h <= 0:
+        raise ValueError(f"窗口抓取尺寸无效: {size!r}")
+    hwnd_dc = None
+    mfc_dc = save_dc = bmp = None
+    try:
+        hwnd_dc = win32gui.GetWindowDC(hwnd)
+        if not hwnd_dc:
+            # 窗口句柄无效/系统拒绝：属于环境型抓屏失败（由调用方跳过）
+            raise WindowCaptureUnavailable(f"拿不到窗口 DC（hwnd={hwnd}）")
+        mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+        save_dc = mfc_dc.CreateCompatibleDC()
+        bmp = win32ui.CreateBitmap()
+        bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+        save_dc.SelectObject(bmp)
+        # 1) 首选：完整内容（DWM 合成窗口也能拿到）
+        ok = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(),
+                                              PW_RENDERFULLCONTENT)
+        if not ok:
+            # 2) 老系统/个别窗口不认新标志 → 退回老式 PrintWindow
+            ok = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 0)
+        if not ok:
+            # 3) 最后兜底：从**窗口 DC** BitBlt（依旧不是屏幕）
+            save_dc.BitBlt((0, 0), (w, h), mfc_dc, (0, 0), win32con.SRCCOPY)
+        bits = bmp.GetBitmapBits(True)
+        img = Image.frombuffer("RGB", (w, h), bits, "raw", "BGRX", 0, 1).copy()
+        if img.size != (w, h):
+            raise RuntimeError(f"窗口抓取结果尺寸不对: {img.size} != {(w, h)}")
+        return img
+    finally:
+        try:
+            if bmp is not None:
+                win32gui.DeleteObject(bmp.GetHandle())
+        except Exception:
+            pass
+        for dc in (save_dc, mfc_dc):
+            try:
+                if dc is not None:
+                    dc.DeleteDC()
+            except Exception:
+                pass
+        try:
+            if hwnd_dc:
+                win32gui.ReleaseDC(hwnd, hwnd_dc)
+        except Exception:
+            pass
+
+
+def _identity_matches(identity, state):
+    """触发时身份 vs 此刻状态：exe/title 必须一致（exe 大小写不敏感）。
+
+    只比 hwnd 还不够：句柄可能被复用，或者同一个进程换了窗口/标题。
+    两边都读不到（None/空）时视为一致；只要一边读到了、另一边不同（包括
+    一边读不到），就按"不一致"处理——宁可跳过，也不冒"截到别的窗口像素"的
+    风险（隐私红线）。
+    """
+    identity = identity or {}
+    state = state or {}
+    want_exe = str(identity.get("exe") or "").strip().casefold()
+    got_exe = str(state.get("exe") or "").strip().casefold()
+    if want_exe != got_exe:
+        return False
+    want_title = str(identity.get("title") or "").strip()
+    got_title = str(state.get("title") or "").strip()
+    return want_title == got_title
+
+
+def verify_capture_window(identity, modeling_apps, state=None,
+                          allow_all_windows=False):
+    """抓取前后复核"要抓的还是触发时那一个 CAD 窗口吗"（纯函数，可单测）。
+
+    参数：
+        identity: 触发时记录的窗口身份
+                  {"hwnd": int, "title": str, "exe": str, "ts": int}
+        modeling_apps: 建模软件名单（DEFAULT_CONFIG["modeling_apps"]）
+        state: 注入的"此刻窗口状态"（单测用），None = 现查系统：
+               {"alive": bool, "foreground": bool, "title": str, "exe": str}
+        allow_all_windows: 调试开关（debug.allow_all_windows），与装聋判定同源。
+                  只放行"是不是 CAD 窗口"这一条，**不放行身份一致性**。
+
+    返回 (ok, reason)。ok=False → 调用方**必须跳过**（不抓取、不保存、不上传）。
+    """
+    identity = identity or {}
+    try:
+        hwnd = int(identity.get("hwnd") or 0)
+    except (TypeError, ValueError):
+        hwnd = 0
+    if not hwnd:
+        # 兼容旧路径：调用方没给 hwnd → 跳过。绝不自己猜"当前前台窗口"。
+        return False, "触发时没拿到窗口句柄 hwnd，跳过（不猜窗口、不截整屏）"
+    if state is None:
+        # 延迟导入：窗口 API 统一放在 input_listener（避免模块级循环导入）
+        from input_listener import window_state
+        state = window_state(hwnd)
+    state = state or {}
+    if not state.get("alive"):
+        return False, f"目标窗口已关闭（hwnd={hwnd}），跳过"
+    if not state.get("foreground"):
+        return False, "前台已切换到别的窗口，跳过（不截非 CAD 窗口）"
+    # 身份一致性先于"是不是 CAD"：标题/exe 与触发时不一致 → 已经不能证明
+    # 还是同一个窗口，直接跳过（哪怕它现在仍是个 CAD 窗口）。
+    if not _identity_matches(identity, state):
+        return False, (
+            "窗口身份已变化（exe/title 与触发时不一致：exe=%r/%r，title=%r/%r），跳过"
+            % (identity.get("exe"), state.get("exe"),
+               identity.get("title"), state.get("title")))
+    from input_listener import is_modeling_window
+    if not is_modeling_window((state.get("title"), state.get("exe")),
+                              modeling_apps or [],
+                              allow_all=allow_all_windows):
+        return False, (
+            "目标窗口已不再是 CAD 窗口（exe=%r，title=%r），跳过"
+            % (state.get("exe"), state.get("title")))
+    return True, ""
 
 
 class AiEye:
     """AI 眼：触发队列 + 后台识别线程。"""
 
-    def __init__(self, cfg: dict, on_result, is_running, images_dir: Path):
+    def __init__(self, cfg: dict, on_result, is_running, images_dir: Path,
+                 modeling_apps=None, allow_all_windows=False,
+                 window_probe=None, rect_probe=None, grab_window=None,
+                 scale_probe=None):
         self.cfg = cfg or {}
         self.provider = self.cfg.get("provider", "mock")
         self.api_key = self.cfg.get("api_key", "")
@@ -112,6 +276,14 @@ class AiEye:
         self.images_dir = Path(images_dir)
         self.on_result = on_result      # (detail, ts) -> None
         self.is_running = is_running    # () -> bool
+        # 截图前复核用：建模软件名单 + 调试开关（与 input_listener 装聋判定同源）
+        self.modeling_apps = list(modeling_apps or [])
+        self.allow_all_windows = bool(allow_all_windows)
+        # 可注入的系统探测（确定性单测用：不碰真实屏幕/真实窗口）
+        self._window_probe = window_probe   # (identity) -> state dict（抓取前、后各查一次）
+        self._rect_probe = rect_probe       # (hwnd) -> (left, top, right, bottom) 逻辑坐标
+        self._grab_window = grab_window     # (hwnd, (w, h)) -> PIL.Image（**按窗口**抓画面）
+        self._scale_probe = scale_probe     # () -> 系统 DPI 缩放系数（单测注入 1.0）
 
         self._queue = queue.Queue(maxsize=self.max_queue)
         self._thread = None
@@ -176,8 +348,14 @@ class AiEye:
 
     # ---------- 触发决策 ----------
 
-    def trigger(self, kind, detail, ts_ms, pos=None):
-        """采集器每记一条相关事件都会喊一次 trigger，这里决定截不截。"""
+    def trigger(self, kind, detail, ts_ms, pos=None, window=None):
+        """采集器每记一条相关事件都会喊一次 trigger，这里决定截不截。
+
+        window = 触发时的窗口身份 {"hwnd", "title", "exe", "ts"}（由
+        input_listener._maybe_ai_eye 提供）。任务队列带着它走；后台截图前
+        会拿它复核"还是不是那个 CAD 窗口"。不给 hwnd 的任务会被跳过
+        （不截图、不上传），绝不退化成"再读一次当前前台窗口"。
+        """
         if not self._accepting or not self.is_running():
             return
         # 1) 事件类型 → 触发开关
@@ -225,7 +403,8 @@ class AiEye:
         # 4) 入队
         try:
             self._queue.put_nowait({"kind": kind, "detail": detail,
-                                    "ts": ts_ms, "pos": pos})
+                                    "ts": ts_ms, "pos": pos,
+                                    "window": dict(window) if window else None})
             with self._lock:
                 self._state["queued"] += 1
         except queue.Full:
@@ -243,34 +422,46 @@ class AiEye:
             with self._lock:
                 self._in_flight = True
                 self._state["queued"] = self._queue.qsize()
-            image_path = None
             try:
-                time.sleep(max(0.0, self.delay_s))  # 等菜单/对话框弹出来
-                image_path, img_b64 = self._capture(job)
-                result = self._recognize(job, img_b64)
-            except Exception as exc:
-                result = {"ok": False, "error": str(exc)[:200]}
-            detail = {
-                "annotates": job["kind"],
-                "annotates_key": (job["detail"].get("key")
-                                  or job["detail"].get("button")
-                                  or job["detail"].get("direction")
-                                  or job["detail"].get("event_type")),
-                "provider": self.provider,
-                "image": image_path,
-                # 相对会话文件夹的路径（v4）：整包拷走会话文件夹也不会断链
-                "image_rel": self._image_rel(image_path),
-                "result": result,
-            }
-            with self._lock:
-                if result.get("ok"):
-                    self._state["ok"] += 1
-                    self._state["last_result"] = str(result.get("answer", {}).get("summary", ""))[:80]
-                else:
-                    self._state["fail"] += 1
-                    self._state["msg"] = str(result.get("error", ""))[:80]
-            # 结果挂回原事件时间戳（对齐），由采集器落库
-            try:
+                image_path = None
+                skipped_reason = None
+                try:
+                    time.sleep(max(0.0, self.delay_s))  # 等菜单/对话框弹出来
+                    image_path, img_b64 = self._capture(job)
+                    result = self._recognize(job, img_b64)
+                except CaptureSkipped as exc:
+                    # 窗口身份复核没通过 / 窗口框无效 → 跳过该任务。
+                    # 不截图、不上传、不算失败、不写识别结果（"没看过"）。
+                    skipped_reason = str(exc)
+                    result = None
+                except Exception as exc:
+                    result = {"ok": False, "error": str(exc)[:200]}
+                with self._lock:
+                    if skipped_reason is not None:
+                        self._state["skipped"] += 1
+                        self._state["msg"] = f"已跳过：{skipped_reason}"[:120]
+                    elif result.get("ok"):
+                        self._state["ok"] += 1
+                        self._state["last_result"] = str(
+                            result.get("answer", {}).get("summary", ""))[:80]
+                    else:
+                        self._state["fail"] += 1
+                        self._state["msg"] = str(result.get("error", ""))[:80]
+                if result is None:
+                    continue
+                detail = {
+                    "annotates": job["kind"],
+                    "annotates_key": (job["detail"].get("key")
+                                      or job["detail"].get("button")
+                                      or job["detail"].get("direction")
+                                      or job["detail"].get("event_type")),
+                    "provider": self.provider,
+                    "image": image_path,
+                    # 相对会话文件夹的路径（v4）：整包拷走会话文件夹也不会断链
+                    "image_rel": self._image_rel(image_path),
+                    "result": result,
+                }
+                # 结果挂回原事件时间戳（对齐），由采集器落库
                 self.on_result(detail, job["ts"])
             finally:
                 with self._lock:
@@ -286,18 +477,101 @@ class AiEye:
         except ValueError:
             return None
 
-    def _capture(self, job):
-        """截"整个建模窗口" → 返回 (图片路径或 None, base64)。
+    def _probe_window_state(self, identity):
+        """查一次目标窗口**此刻**状态（注入的探测优先；None = 现查系统）。"""
+        if self._window_probe is not None:
+            return self._window_probe(identity)
+        from input_listener import window_state
+        try:
+            hwnd = int((identity or {}).get("hwnd") or 0)
+        except (TypeError, ValueError):
+            hwnd = 0
+        return window_state(hwnd)
 
+    def _window_rect(self, hwnd):
+        """目标窗口矩形（逻辑坐标）。最小化/无效/已关闭 → None（抓取前就拒绝）。"""
+        if self._rect_probe is not None:
+            return self._rect_probe(hwnd)       # 单测注入：直接给窗口矩形
+        try:
+            import win32gui
+            if not hwnd:
+                return None
+            if not win32gui.IsWindow(hwnd) or win32gui.IsIconic(hwnd):
+                return None
+            return win32gui.GetWindowRect(hwnd)   # 逻辑坐标
+        except Exception:
+            return None
+
+    def _scale(self):
+        if self._scale_probe is not None:
+            return float(self._scale_probe())
+        return _screen_scale()
+
+    def _probe_and_capture(self, identity):
+        """探测 + 按窗口抓取 + 抓后复核 → 返回窗口尺寸的 PIL.Image。
+
+        任何探测/矩形/抓取阶段的异常都向上抛（由 _capture 统一转 CaptureSkipped；
+        已归类的 CaptureSkipped 原样保留）。**这里不编码、不落盘**。
+        """
+        # 1) 抓取前复核：窗口身份不一致/切走 → 一个像素都不抓
+        state = self._probe_window_state(identity)
+        ok, reason = verify_capture_window(
+            identity, self.modeling_apps, state=state,
+            allow_all_windows=self.allow_all_windows)
+        if not ok:
+            raise CaptureSkipped(reason)
+        try:
+            hwnd = int(identity.get("hwnd") or 0)
+        except (TypeError, ValueError):
+            hwnd = 0
+        # 2) 窗口矩形无效（最小化/异常）→ 抓取前拒绝，绝不先抓整屏
+        size = window_capture_size(self._window_rect(hwnd), self._scale())
+        if size is None:
+            raise CaptureSkipped("窗口框无效（最小化/异常），跳过（不抓取任何画面）")
+        # 3) 只抓这个窗口自己的内容（PrintWindow）
+        grab = self._grab_window if self._grab_window is not None else _grab_window_content
+        img = grab(hwnd, size)
+        if img is None or tuple(img.size) != tuple(size):
+            raise CaptureSkipped("按窗口抓取结果异常，跳过（不保存/不上传）")
+        # 4) 抓完再复核一次：这段时间窗口被关掉/切走 → 丢弃这张图
+        post_state = self._probe_window_state(identity)
+        ok2, reason2 = verify_capture_window(
+            identity, self.modeling_apps, state=post_state,
+            allow_all_windows=self.allow_all_windows)
+        if not ok2:
+            raise CaptureSkipped(f"抓取后复核失败，图已丢弃（不保存/不上传）: {reason2}")
+        return img
+
+    def _capture(self, job):
+        """抓**触发时那一个建模窗口**的画面 → 返回 (图片路径或 None, base64)。
+
+        隐私红线（2026-10-23 全程序检查阻断项 + 二次复验加固）：
+        - **按窗口抓取**：用 PrintWindow 只把目标窗口自己的内容画进位图；
+          没有整屏截图、没有"先整屏再裁剪"、没有整屏兜底；
+        - 抓取前复核窗口身份（hwnd 存活 / 仍在前台 / exe+title 与触发时一致），
+          不满足 → 抛 CaptureSkipped：不抓取、不保存、不上传、不写识别结果；
+        - 窗口最小化/矩形无效 → 在抓取前就拒绝（抓取函数 0 调用）；
+        - 抓取**再复核一次**（窗口仍在/没被切走）；失败 → 丢弃已抓图片，
+          同样不保存、不上传、不回调；
+        - **探测/矩形/抓取阶段抛任何未归类异常（如 OSError）也按跳过处理**：
+          不保存、不上传、不回调、不算识别失败（第三轮复验 P0 边界）；
+        - 旧路径没带 hwnd → 跳过（不猜"当前前台窗口"）。
         勾了"保存截图"（keep_images=true）：v4 写到**本次会话**的 images\\ 下
         （data\\sessions\\<开始时刻>\\images\\xxx.jpg，不再按日期分层）并返回路径；
         没勾：只留内存里的 base64，磁盘从头到尾不落图。
         """
-        from PIL import ImageGrab
-        # 抓**所有显示器**（双屏时副屏上的建模窗口也能截到）
-        full = ImageGrab.grab(all_screens=True)
-        box = self._foreground_window_box(full.size)
-        img = full.crop(box) if box else full       # 按窗口裁剪；拿不到窗口就整屏
+        identity = (job or {}).get("window") or {}
+        try:
+            img = self._probe_and_capture(identity)
+        except CaptureSkipped:
+            raise
+        except Exception as exc:
+            # 探测/矩形/抓取阶段的异常统一按"跳过"：宁可不截，也不产生失败回调。
+            raise CaptureSkipped(
+                f"窗口探测/抓取异常，跳过（不保存/不上传/不回调）: "
+                f"{str(exc)[:120]}") from exc
+        # 只有前后两次复核都通过才编码/落盘。
+        # 编码/写盘失败属于真实故障，照常上报 fail（不在这里吞）。
         buf = io.BytesIO()
         img.convert("RGB").save(buf, format="JPEG", quality=85)
         img_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -311,34 +585,6 @@ class AiEye:
                 n += 1
             path.write_bytes(buf.getvalue())
         return (str(path) if path else None, img_b64)
-
-    @staticmethod
-    def _foreground_window_box(img_size):
-        """前台窗口在截图里的裁剪框（**物理像素**，跨显示器通用）。
-
-        换算链：逻辑坐标 ×系统DPI缩放 → 物理桌面坐标 → 减去虚拟屏原点
-        → 钳制在截图范围内。窗口最小化/异常时返回 None（调用方退化为整屏）。
-        """
-        try:
-            import win32gui
-            hwnd = win32gui.GetForegroundWindow()
-            if not hwnd:
-                return None
-            left, top, right, bottom = win32gui.GetWindowRect(hwnd)   # 逻辑坐标
-            scale = _screen_scale()                                   # 系统 DPI 缩放
-            ox, oy = _virtual_origin_physical()                       # 虚拟屏原点
-            left = int(round(left * scale - ox))
-            top = int(round(top * scale - oy))
-            right = int(round(right * scale - ox))
-            bottom = int(round(bottom * scale - oy))
-            w, h = img_size
-            left, top = max(0, left), max(0, top)
-            right, bottom = min(w, right), min(h, bottom)
-            if right - left < 50 or bottom - top < 50:
-                return None      # 矩形不合理（最小化/异常）→ 整屏兜底
-            return (left, top, right, bottom)
-        except Exception:
-            return None
 
     def _recognize(self, job, img_b64):
         """云端识别 → 返回 {"ok": true, "answer": {...}}"""

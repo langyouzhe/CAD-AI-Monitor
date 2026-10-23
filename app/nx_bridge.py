@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 
 import journal_parser
+from collector_core import nx_journal_dir
 
 
 class NxBridge:
@@ -32,6 +33,10 @@ class NxBridge:
         self.cfg = cfg or {}
         self.journal_path = self.cfg.get("journal_path") or ""
         self.journal_dirs = list(self.cfg.get("journal_dirs") or [])
+        # 实际数据根目录（input_listener 会把会话的数据目录传进来）。
+        # 默认 journal 目录必须和界面【打开 NX 日志目录】按钮同源：
+        #   <data_dir>\journals（见 collector_core.nx_journal_dir）
+        self.data_dir = self.cfg.get("data_dir") or None
         self.poll_s = float(self.cfg.get("poll_interval_s", 1.0))
         self.on_event = on_event
         self.is_running = is_running
@@ -39,6 +44,7 @@ class NxBridge:
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._state = {"backend": "nx", "connected": False, "journal_file": None,
+                       "journal_dir": str(nx_journal_dir(self.data_dir)),
                        "last_error": None}
         self._current = None
         self._last_line_no = 0
@@ -64,12 +70,18 @@ class NxBridge:
     # ---------- 内部 ----------
 
     def _dirs(self):
+        """候选目录：显式配置优先；否则 桌面/文档/下载 + `<data_dir>\\journals`。
+
+        最后一个候选必须和界面【打开 NX 日志目录】按钮、NX 提醒里的
+        journal_dir 是**同一个文件夹**（以前桥用的是源码仓库的 data\\journals，
+        打包成 exe 或自定义数据目录时和按钮对不上）。
+        """
         if self.journal_dirs:
             return self.journal_dirs
         home = Path.home()
         out = []
         for d in (home / "Desktop", home / "Documents", home / "Downloads",
-                  Path(__file__).resolve().parent.parent / "data" / "journals"):
+                  nx_journal_dir(self.data_dir)):
             try:
                 if d.is_dir():
                     out.append(str(d))

@@ -21,6 +21,7 @@ v4 与 v3 的区别（按《项目上下文》第 6 节「会话存储规格（v
 数据全部只存在本地文件里，不会联网、不会上传。
 """
 import argparse
+import copy
 import ctypes
 import json
 import os
@@ -40,7 +41,7 @@ import cad_discovery
 # 等觉得"别人可以放心用了"再发 1.0.0。
 # 注意：文档/注释里出现的 v2、v3、v4 是**开发内部迭代编号**（第 2 代架构、第 3 代加视觉、
 # 第 4 代会话存储），不是发布版本号——两者不要混。
-APP_VERSION = "0.2.1"
+APP_VERSION = "0.2.2"
 
 # events.db 的表结构版本（表结构不变时这个数字不动）
 SCHEMA_VERSION = 2
@@ -103,6 +104,9 @@ DEFAULT_CONFIG = {
         "journal_path": "",                # ← 指定 journal 文件（最稳）；留空=自动找
         "journal_dirs": [],                # 留空 = 默认 桌面/文档/下载/data\journals
         "poll_interval_s": 1.0,
+        # NX 切到前台、却还没找到录制日志时，界面上提醒"记得点 Record Journal"。
+        # （为什么只能提醒、不能自动开录制：见 input_listener.nx_record_hint 的说明）
+        "hint_when_not_recording": True,   # 嫌吵可以改 false
     },
     # 笔势（按住鼠标键拖动，如 SW 右键笔势导引）记录
     "gestures": {
@@ -189,6 +193,21 @@ def resolve_data_dir() -> Path:
             return docs / "CAD-AI-Monitor" / "data"
         return portable
     return Path(__file__).resolve().parent.parent / "data"
+
+
+def nx_journal_dir(data_dir=None) -> Path:
+    r"""NX 录制日志目录（**唯一来源**）：`<数据根>\journals`。
+
+    为什么单独抽一个函数：这个目录在三个地方被用到——界面按钮【打开 NX 日志
+    目录】、NX 提醒的 journal_dir、NxBridge 的默认搜索目录。以前桥用的是
+    `Path(__file__).parent.parent / "data" / "journals"`（打包成 exe / 自定义
+    数据目录时和按钮指向的不是同一个文件夹），现在统一走这里，保证"按钮打开
+    的文件夹"就是"桥会去找的文件夹"。
+
+    data_dir 省略时按 `resolve_data_dir()` 找数据根（源码运行 = 仓库 data\）。
+    """
+    root = Path(data_dir) if data_dir is not None else resolve_data_dir()
+    return root / "journals"
 
 
 # ======================================================================
@@ -759,14 +778,26 @@ class ConfigManager:
     """配置管理：读 data\\config.json；没有就写一份默认的。
 
     用户在设置文件里改的项，点【开始采集】时重新读入生效。
+
+    环境变量 `AI_EYE_KEY`（可选）：**只在运行时**覆盖 AI 眼密钥，绝不落盘。
+    load() 之后的 `_values` 里能看到它（AI 眼用它），但 `save()` / `ensure_file()`
+    写出的 config.json 里永远不会有它——避免"设了环境变量，结果被设置界面
+    顺手写到文件里"，也避免把 DEFAULT_CONFIG 污染成带密钥的默认值。
     """
 
     def __init__(self, data_dir: Path):
         self.path = Path(data_dir) / "config.json"
         self._values = None
+        # 环境变量密钥是否正在生效；生效时设置界面要显示"来自环境变量"
+        self.env_key_active = False
+        # config.json 里原本写的 ai_eye.api_key（环境变量生效时保存要保留它）
+        self.file_api_key = ""
 
     def load(self) -> dict:
-        """读配置：文件不存在→写默认；坏了→备份后写默认；缺的字段→默认补上。"""
+        """读配置：文件不存在→写默认；坏了→备份后写默认；缺的字段→默认补上。
+
+        环境变量 AI_EYE_KEY 只进**运行时**的返回值，不写回文件。
+        """
         if self.path.exists():
             try:
                 user_cfg = json.loads(self.path.read_text(encoding="utf-8"))
@@ -783,8 +814,14 @@ class ConfigManager:
         else:
             user_cfg = {}
         merged = self._merge(DEFAULT_CONFIG, user_cfg)
-        # P2-5：环境变量优先于配置文件，避免把 key 明文写进 config.json
+        # 记下文件里原本的 key（保存时若环境变量生效，要保留它而不是写环境密钥）
+        ai_user = user_cfg.get("ai_eye")
+        self.file_api_key = (str((ai_user or {}).get("api_key") or "")
+                             if isinstance(ai_user, dict) else "")
+        # P2-5：环境变量优先于配置文件，避免把 key 明文写进 config.json。
+        # 注意 merged 是 DEFAULT_CONFIG 的深拷贝，这里改它不会污染默认值。
         env_key = os.environ.get("AI_EYE_KEY")
+        self.env_key_active = bool(env_key)
         if env_key:
             merged.setdefault("ai_eye", {})["api_key"] = env_key
         self._values = merged
@@ -793,26 +830,49 @@ class ConfigManager:
 
     @staticmethod
     def _merge(default: dict, user: dict) -> dict:
-        """把用户写的配置叠在默认配置上（缺什么补什么，不改用户已有的）。"""
-        out = dict(default)
+        """把用户写的配置叠在默认配置上（缺什么补什么，不改用户已有的）。
+
+        **必须 deepcopy**：以前是浅复制，返回的 dict 里嵌套的 `ai_eye` 等
+        子字典和 DEFAULT_CONFIG 是同一个对象——之后往返回值里注入环境变量密钥，
+        就把"默认配置"也污染成带密钥了，ensure_file / 设置保存会把它写到磁盘。
+        """
+        out = copy.deepcopy(default)
         for key, value in user.items():
             if isinstance(value, dict) and isinstance(out.get(key), dict):
                 out[key] = ConfigManager._merge(out[key], value)
             else:
-                out[key] = value
+                out[key] = copy.deepcopy(value)
         return out
 
     def ensure_file(self):
-        """确保设置文件存在（用户点【打开设置】时能找到它）。"""
+        """确保设置文件存在（用户点【打开设置】时能找到它）。
+
+        写出的永远是**干净的默认配置**（不带环境变量密钥）。
+        """
         try:
             if not self.path.exists():
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 self.path.write_text(
-                    json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
+                    json.dumps(copy.deepcopy(DEFAULT_CONFIG), ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
         except Exception:
             pass
+
+    def save(self, values: dict):
+        """把设置写回 config.json（返回写入路径）。
+
+        环境变量 AI_EYE_KEY 生效时，`api_key` 保留**文件里原本的值**（或空白）：
+        环境变量只用于运行时，绝不写进文件。设置界面的【保存】走这里。
+        """
+        payload = copy.deepcopy(values or {})
+        ai = payload.setdefault("ai_eye", {})
+        if self.env_key_active:
+            ai["api_key"] = self.file_api_key
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+        return self.path
 
     @property
     def values(self) -> dict:

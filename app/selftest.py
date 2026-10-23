@@ -39,7 +39,9 @@ from collector_core import (  # noqa: E402
     session_db_path, session_meta_path, session_summaries, sessions_root,
     write_session_json,
 )
-from input_listener import CollectorSession, is_modeling_window  # noqa: E402
+from input_listener import (  # noqa: E402
+    CollectorSession, is_modeling_window, nx_record_hint,
+)
 from solidworks_bridge import diff_snapshot  # noqa: E402
 
 APP_DIR = str(Path(__file__).resolve().parent)
@@ -135,14 +137,24 @@ def test_diff_snapshot():
 # ---------- 4. 建模窗口判定（装聋） ----------
 
 def test_window_filter():
-    apps = [{"exe": "SLDWORKS.exe", "title": "SOLIDWORKS"}]
+    apps = [{"exe": "SLDWORKS.exe", "title": "SOLIDWORKS"},
+            {"exe": "ugraf.exe", "title": "NX"}]
     assert is_modeling_window(("Part1 - SOLIDWORKS", "SLDWORKS.exe"), apps)
     assert is_modeling_window(("whatever", "SLDWORKS.exe"), apps)      # exe 命中
-    assert is_modeling_window(("SOLIDWORKS Premium 2022", "explorer.exe"), apps)  # 标题命中
+    # 隐私回归（2026-10-23 高危 1）：exe 已知但不是 CAD → 标题再像也拒绝。
+    # 浏览器标签页标题里出现 "SOLIDWORKS"/"NX"（搜索页、网盘文件名、聊天标题）
+    # 以前会被当成建模窗口，导致浏览器里的操作被记录（装聋失效）。
+    assert not is_modeling_window(("SOLIDWORKS Premium 2022", "explorer.exe"), apps)
+    assert not is_modeling_window(("NX 2406 - 百度搜索", "chrome.exe"), apps)
+    assert not is_modeling_window(("SOLIDWORKS 教程 - Edge", "msedge.exe"), apps)
     assert not is_modeling_window(("百度一下", "chrome.exe"), apps)    # 都命中不了
+    # exe 取不到（None/空）才用标题兜底（权限不足拿不到进程名的情况）
+    assert is_modeling_window(("Designcenter NX 2512", None), apps)
+    assert is_modeling_window(("NX 2512", ""), apps)
     assert is_modeling_window((None, None), apps, allow_all=True)      # 调试开关
     assert not is_modeling_window((None, None), apps)
-    ok("装聋判定正确（exe/标题命中，其他窗口全部不记）")
+    assert not is_modeling_window(("", ""), apps)
+    ok("装聋判定正确（exe 已知时只认 exe；exe 取不到才用标题兜底）")
 
 
 # ---------- 5+6. 端到端（注入假输入 + 离开/回来） ----------
@@ -198,29 +210,46 @@ def _mk_session(tmp, idle_minutes, stream1_enabled=False, poll_s=0.5):
 def test_end_to_end_stream2():
     """真实系统输入路径验证：注入假按键 → 钩子收到 → 入库。
 
-    注意：这个测试要求"注入成功"，但注入可能被系统安全机制拒绝（测试机
-    前台窗口是浏览器时会这样）。所以断言放宽为"钩子确实在工作、事件确实
-    入库"，注入成功与否单独提示。
+    注意：这个测试要求"注入成功"，但注入可能被系统安全机制拒绝/丢弃
+    （实测某些权限/安全软件环境里 SendInput 返回成功、低层键盘钩子却收不到，
+    LastInputInfo 也不更新）。所以：
+    - 钩子线程必须活着（真实安装成功）；
+    - 注入成功 → 验证"真实系统输入 → 钩子 → 回调 → 入库"整条链路；
+    - 注入被环境丢弃 → 明确 SKIP 这一段，改用钩子回调路径验证入库（保证自检
+      确定性；文档要求自检不依赖真实输入）。
     """
     tmp = tempfile.mkdtemp(prefix="cad-ai-e2e-")
     session = _mk_session(tmp, idle_minutes=10.0)  # 阈值调大，本测试不测离开
     session.start()
     time.sleep(0.6)
+    assert session._kb_listener is not None and session._kb_listener.is_alive(), \
+        "键盘钩子线程应存活（真实安装成功）"
+    assert session._ms_listener is not None and session._ms_listener.is_alive(), \
+        "鼠标钩子线程应存活（真实安装成功）"
     send_key(0x1E)          # 字母 A
     time.sleep(0.2)
     send_key(0x1E, up=True)
     time.sleep(1.2)          # 留时间让事件走完 监听 → 回调 → 入库
+    with session._lock:
+        injected_count = session._counts.get("stream2", 0)
+    if injected_count == 0:
+        # 环境把合成键盘输入丢了：退回到"钩子回调 → 入库"这段确定性链路
+        print("  SKIP 合成键盘输入被当前环境丢弃（低层钩子收不到）；"
+              "改用钩子回调路径验证入库（真实注入在普通桌面/无安全拦截时可跑）")
+        session._on_key_press(FakeKey("a"))
+        session._on_key_press(FakeKey("s"))
+        time.sleep(0.2)
     session.stop()
 
     events = session.store.query_session(session.session_id)
     kinds = [(e["source"], e["kind"]) for e in events]
     key_downs = [e for e in events if e["kind"] == "key_down"]
-    assert key_downs, "钩子应至少收到按键（注入或真人输入）"
+    assert key_downs, "钩子应至少收到按键（注入或钩子回调）"
     injected = [d for d in key_downs if d["detail"].get("key") in ("a", "A")]
-    if injected:
+    if injected_count:
         print("  注入的假按键 'a' 已被钩子捕获入库")
     else:
-        print("  提示：注入可能被系统拒绝，但钩子工作正常（收到真人按键）")
+        print("  注入被环境拒绝；已用钩子回调验证入库链路（测试仍有效）")
     # 顺序正确性
     seqs = [e["seq"] for e in events]
     assert seqs == list(range(1, len(seqs) + 1)), "seq 不连续"
@@ -526,39 +555,180 @@ def test_reconcile():
     ok("三方对账规则正确（无效果/孤儿/视觉缺票/视觉失败 + 中键数字豁免 + 松开不算动作）")
 
 
-# ---------- 9.5 截图裁剪框：DPI 换算 + 边界（回归锁） ----------
+# ---------- 9.5 按窗口抓取：尺寸换算 + 无效矩形拒绝（回归锁） ----------
 
-def test_capture_dpi_box():
-    from ai_eye import AiEye, _screen_scale, _virtual_origin_physical
-    from PIL import ImageGrab
-    import win32gui
-    scale = _screen_scale()
-    assert scale >= 1.0, f"缩放系数应 >= 1.0，实际 {scale}"
+class _DesktopUnavailable(RuntimeError):
+    """自检环境限制：当前桌面/前台窗口拿不到（锁屏/无交互桌面）。
+
+    这是 selftest 里**唯一**允许 SKIP 的原因。任何断言失败都不许伪装成它。
+    """
+
+
+def _env_capture_error_types():
+    """明确属于"环境不可用"的异常白名单（Win32/系统抓屏错误）。
+
+    第三轮复验 P2：截图测试只能把这一类转成 SKIP；ValueError/MemoryError/
+    RuntimeError 等程序错误必须向外传播（自检失败）。
+    """
+    import ai_eye
+    env_types = [OSError, ai_eye.WindowCaptureUnavailable]
     try:
-        img = ImageGrab.grab(all_screens=True)     # 所有显示器
-    except Exception as exc:
-        # 工作站锁屏 / 没有可交互桌面时抓不到屏：属于环境限制，不算代码失败。
-        # 解锁后重跑本项即可覆盖"真实截图裁剪"（--ci 里本来就不跑这项）。
-        assert AiEye._foreground_window_box((0, 0)) is None
-        print(f"  SKIP 真实截屏验证（当前桌面不可截图：{exc}）；"
-              f"解锁屏幕后重跑可覆盖此项")
+        import pywintypes
+        env_types.append(pywintypes.error)
+    except ImportError:
+        pass
+    return tuple(env_types)
+
+
+def _probe_real_window_capture():
+    """真实探测：取前台窗口矩形 → PrintWindow 按窗口抓一张图（不整屏）。
+
+    只有**明确的环境原因**才转 _DesktopUnavailable：
+    - 没有前台窗口 / 前台窗口最小化 / 窗口矩形无效；
+    - Win32/系统抓屏错误（OSError、pywintypes.error、WindowCaptureUnavailable）。
+    ValueError/MemoryError/RuntimeError 等程序错误照常向外抛 → 自检失败，
+    **绝不伪装成 SKIP**。
+    """
+    import win32gui
+    from ai_eye import _grab_window_content, window_capture_size
+    hwnd = int(win32gui.GetForegroundWindow() or 0)
+    if not hwnd:
+        raise _DesktopUnavailable("没有前台窗口")
+    try:
+        iconic = bool(win32gui.IsIconic(hwnd))
+        rect = win32gui.GetWindowRect(hwnd)
+    except _env_capture_error_types() as exc:
+        raise _DesktopUnavailable(f"拿不到前台窗口矩形: {exc}") from exc
+    if iconic:
+        raise _DesktopUnavailable("前台窗口处于最小化状态")
+    size = window_capture_size(rect)
+    if size is None:
+        raise _DesktopUnavailable(f"前台窗口矩形无效: {rect!r}")
+    try:
+        img = _grab_window_content(hwnd, size)
+    except _env_capture_error_types() as exc:   # 明确的抓屏系统错误 → 环境限制
+        raise _DesktopUnavailable(f"当前桌面/窗口不可抓取: {exc}") from exc
+    return {"hwnd": hwnd, "rect": rect, "size": size, "image": img}
+
+
+def _assert_real_window_capture(info):
+    """严格断言：抓到的只能是**窗口尺寸**的图，无效窗口框必须被拒绝。
+
+    没有 try/except —— 断言失败必须让自检失败（旧版把 AssertionError 也当
+    "桌面不可截图" SKIP 吞掉，非法裁剪框照样打印 OK；这里就是回归锁）。
+    """
+    from ai_eye import window_capture_size
+    rect = info["rect"]
+    size = info["size"]
+    img = info["image"]
+    assert size is not None, f"窗口矩形非法却算出了抓取尺寸: {rect!r}"
+    assert size == window_capture_size(rect), (size, rect)
+    w, h = size
+    assert w >= 50 and h >= 50, f"窗口抓取尺寸不合理: {size}"
+    assert img is not None and tuple(img.size) == (w, h), (
+        f"按窗口抓取应只得到窗口尺寸图：image={getattr(img, 'size', None)} size={size}")
+
+
+def test_capture_dpi_box(desktop_probe=None):
+    """按窗口抓取的尺寸换算 / 无效矩形拒绝（**不再有整屏 grab 再裁剪**）。
+
+    2026-10-23 二次复验：截图改为 PrintWindow 按窗口抓画面，没有整屏路径。
+    这里验证纯换算与拒绝规则；桌面可抓时再验证"抓到的图 = 窗口尺寸"。
+    SKIP 只允许"当前桌面拿不到前台窗口/不可抓取"这一种环境原因；断言失败
+    一律向外传播（**绝不能**像旧版那样 except Exception 把 AssertionError
+    也吞成 SKIP）。
+    """
+    from ai_eye import window_capture_size
+    # (1) 正常窗口矩形 → 位图尺寸 = 窗口尺寸（逻辑 × 系统 DPI 缩放）
+    assert window_capture_size((100, 100, 500, 400)) == (400, 300)
+    assert window_capture_size((-100, 50, 500, 400), scale=1.5) == (900, 525)
+    # (2) 无效矩形/最小化（宽或高 < 50）→ None（调用方抓取前拒绝，0 次抓取）
+    assert window_capture_size((0, 0, 10, 10)) is None
+    assert window_capture_size((100, 100, 40, 400)) is None
+    assert window_capture_size("不是矩形") is None
+    assert window_capture_size(None) is None
+    assert window_capture_size((0, 0, 1920, 1080), scale=0) is None
+    assert window_capture_size((0, 0, 200000, 100)) is None
+    # (3) 真实窗口（本环境能拿到桌面时）：抓到的图必须正好是窗口尺寸
+    try:
+        info = (desktop_probe or _probe_real_window_capture)()
+    except _DesktopUnavailable as exc:
+        # 工作站锁屏 / 没有可交互桌面：属于环境限制，不算代码失败。
+        print(f"  SKIP 真实按窗口抓取验证（当前桌面不可用：{exc}）；"
+              f"解锁屏幕后重跑可覆盖真实窗口抓取")
+        ok("按窗口抓取尺寸换算/无效矩形拒绝正确（真实窗口抓取本环境跳过）")
         return
-    box = AiEye._foreground_window_box(img.size)
-    if box is not None:
-        l, t, r, b = box
-        assert 0 <= l < r <= img.size[0], box
-        assert 0 <= t < b <= img.size[1], box
-        assert r - l >= 50 and b - t >= 50, box
-        # 与"逻辑坐标 × 系统缩放 − 虚拟屏原点"的手工换算一致
-        hwnd = win32gui.GetForegroundWindow()
-        wl, wt, _, _ = win32gui.GetWindowRect(hwnd)
-        ox, oy = _virtual_origin_physical()
-        assert l == max(0, int(round(wl * scale - ox))), (l, wl, scale, ox)
-        assert t == max(0, int(round(wt * scale - oy))), (t, wt, scale, oy)
-    # 拿不到合理窗口时必须是 None（调用方退化为整屏），不能抛异常
-    assert AiEye._foreground_window_box((0, 0)) is None
-    print(f"  系统缩放={scale:g}，全屏(所有显示器)={img.size}，裁剪框={box}")
-    ok("截图裁剪框：多显示器 + DPI 换算正确、越界安全回退")
+    _assert_real_window_capture(info)     # 严格断言：失败 → 自检失败
+    print(f"  真实窗口 hwnd={info['hwnd']} 矩形={info['rect']} "
+          f"抓取尺寸={info['size']}（按窗口，不是整屏）")
+    ok("按窗口抓取：只得到窗口尺寸图 + 窗口框无效时抓取前拒绝（真实窗口验证）")
+
+
+def test_invalid_capture_box_fails_selftest():
+    """【P2 回归】非法裁剪框/程序错误必须让自检失败，只有环境不可用才 SKIP。
+
+    旧版 test_capture_dpi_box 用 `except Exception` 包住全部断言，AssertionError
+    被当成"桌面不可截图"打印 SKIP、非法裁剪框照样 OK。第三轮复验又指出：宽泛
+    except 会把 ValueError/MemoryError/RuntimeError 也当环境 SKIP。这里直接调
+    **真正的自检函数**验证：
+    - 非法窗口框 → 严格断言抛错；
+    - 注入 ValueError/MemoryError/RuntimeError → 原样向外传播（自检失败）；
+    - 注入"明确的环境不可用" → 才允许 SKIP。
+    """
+    # 1) 非法窗口框 → 严格断言必须抛
+    def bad_probe():
+        return {"hwnd": 1, "rect": (100, 100, 40, 400),
+                "size": None, "image": None}
+
+    try:
+        test_capture_dpi_box(desktop_probe=bad_probe)
+    except AssertionError as exc:
+        print(f"  非法窗口框 → 自检断言抛出: {str(exc)[:100]}")
+    else:
+        raise AssertionError("非法裁剪框必须让自检失败"
+                             "（旧 bug：被当成 SKIP 还打印 OK）")
+
+    # 2) 程序错误（ValueError/MemoryError/RuntimeError）→ 必须向外传播
+    for injected in (ValueError("坏参数"),
+                     MemoryError(),
+                     RuntimeError("程序 bug")):
+        def raising_probe(_exc=injected):
+            raise _exc
+
+        try:
+            test_capture_dpi_box(desktop_probe=raising_probe)
+        except Exception as got:
+            assert got is injected, (type(got), got)
+        else:
+            raise AssertionError(
+                f"{type(injected).__name__} 必须让自检失败，不能被当成 SKIP")
+
+    # 3) 明确的环境不可用 → 才允许 SKIP（捕获输出确认真的走了 SKIP 分支）
+    import contextlib
+    import io
+
+    def unavailable_probe():
+        raise _DesktopUnavailable("测试模拟：没有交互桌面")
+
+    skip_out = io.StringIO()
+    with contextlib.redirect_stdout(skip_out):
+        test_capture_dpi_box(desktop_probe=unavailable_probe)
+    assert "SKIP" in skip_out.getvalue(), skip_out.getvalue()
+
+    # 4) 环境白名单本身：只认 OSError / pywintypes.error / WindowCaptureUnavailable
+    from ai_eye import WindowCaptureUnavailable
+    env_types = _env_capture_error_types()
+    for env_err in (OSError("系统错误"), WindowCaptureUnavailable("拿不到窗口")):
+        assert isinstance(env_err, env_types), type(env_err)
+    try:
+        import pywintypes
+        assert pywintypes.error in env_types, env_types
+    except ImportError:
+        pass
+    for prog_err in (ValueError("x"), MemoryError(), RuntimeError("x"),
+                     KeyError("x"), AttributeError("IFace2.Name")):
+        assert not isinstance(prog_err, env_types), type(prog_err)
+    ok("非法裁剪框/程序错误会让自检失败（断言向外传播）；只有明确环境不可用才 SKIP")
 
 
 # ---------- 10. 笔势 + AI 眼（会话级合成验证） ----------
@@ -577,6 +747,13 @@ def test_gesture_and_ai_eye():
         }, f, ensure_ascii=False, indent=2)
     session = CollectorSession(tmp)
     session.start()
+    assert session.ai_eye is not None, "AI 眼应按配置启动"
+    # 接线回归：会话创建 AI 眼时必须把建模软件名单/调试开关传进去，
+    # 否则"截图前复核"永远判失败 → AI 眼等于被静默关掉。
+    assert session.ai_eye.modeling_apps == list(session.cfg.get("modeling_apps") or []), \
+        "AI 眼必须拿到与装聋判定同一份 modeling_apps"
+    assert session.ai_eye.allow_all_windows is True, \
+        "debug.allow_all_windows 要传给 AI 眼（自检模式）"
     if session.ai_eye is not None:
         session.ai_eye._capture = _fake_capture(session.ai_eye)  # 不依赖真实屏幕
     time.sleep(0.6)
@@ -601,11 +778,18 @@ def test_gesture_and_ai_eye():
         iso_ms = int(datetime.fromisoformat(e["ts_iso"]).timestamp() * 1000)
         assert abs(iso_ms - e["ts_ms"]) <= 1, f"时间戳两列不一致: {e}"
     gestures = [e for e in events if e["kind"] == "gesture"]
-    assert len(gestures) == 1, f"应有一条笔势事件: {gestures}"
+    # 真人输入可能同时产生别的笔势（本测试开着全局钩子）→ 只认本测试注入的那一条，
+    # 否则桌面活跃时自检会随机失败（"1 条笔势"断言被真实鼠标打扰）。
+    injected = [e for e in gestures
+                if e["detail"].get("start") == [400, 400]
+                and e["detail"].get("end") == [500, 300]]
+    assert len(injected) == 1, (
+        f"应有一条本测试注入的笔势事件: injected={injected} all={gestures}")
+    gestures = injected
     assert gestures[0]["detail"]["direction"] == "右上", gestures[0]["detail"]
     assert gestures[0]["detail"]["distance_px"] >= 80
     assert gestures[0]["detail"].get("polyline"), "应记录途经点"
-    assert gestures[0]["detail"].get("command_id") is not None or True, "笔势事件带映射信息字段"
+    assert "command_id" in gestures[0]["detail"], "笔势事件必须带 command_id 字段（映射信息）"
     # AI 眼：会话级只验证组件起来了；严格对齐由 test_ai_eye_unit 保证
     # （真人输入同时也在触发 AI 眼，不能做确定性断言）
     assert session.ai_eye is not None, "AI 眼应按配置启动"
@@ -1212,6 +1396,1071 @@ def test_nx_journal_bridge():
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+def test_nx_record_hint():
+    """方案 A（2026-10-23）：NX 手动录制提醒（纯函数，4 种情况 + 边界）。
+
+    只喂 (窗口, 后端状态, 配置, 数据目录)，不读全局、不依赖 Windows API、
+    不需要 NX 真的开着，所以能进 --ci。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-nxhint-"))
+    nx_window = ("Designcenter NX 2512", "ugraf.exe")
+    sw_window = ("Part1 - SOLIDWORKS", "SLDWORKS.exe")
+    cfg = {
+        "stream1": {"enabled": True, "backends": ["solidworks", "creo", "nx"]},
+        "nx": {"hint_when_not_recording": True},
+    }
+    not_connected = [{"backend": "nx", "connected": False, "last_error": "没找到"}]
+    connected = [{"backend": "nx", "connected": True, "journal_file": "x.cs"}]
+    try:
+        # 1) 命中：启用了 nx 后端 + 前台是 NX + nx 没连上 → 提醒 + 日志目录
+        hint = nx_record_hint(nx_window, not_connected, cfg, tmp)
+        assert hint is not None, hint
+        assert "Record Journal" in hint["text"], hint
+        assert "nx.journal_path" in hint["text"], hint
+        assert Path(hint["journal_dir"]) == tmp / "journals", hint
+
+        # 2) 已连接（找到 journal）→ 不提醒
+        assert nx_record_hint(nx_window, connected, cfg, tmp) is None
+
+        # 3) 配置里把提醒关掉 → 不提醒
+        off = {"stream1": cfg["stream1"],
+               "nx": {"hint_when_not_recording": False}}
+        assert nx_record_hint(nx_window, not_connected, off, tmp) is None
+
+        # 4) 前台不是 NX（SW 窗口）→ 不提醒
+        assert nx_record_hint(sw_window, not_connected, cfg, tmp) is None
+
+        # 4b) 【P3 回归】exe 优先：浏览器 exe 已知不是 NX → 标题含 NX 也不提醒
+        browser = ("NX 2406 - 百度搜索", "chrome.exe")
+        assert nx_record_hint(browser, not_connected, cfg, tmp) is None
+        assert nx_record_hint(("NX 2512 - 搜索", "msedge.exe"), not_connected,
+                              cfg, tmp) is None
+        # exe 已知的非 CAD 程序也不能靠标题"救"成 NX（和装聋同一规则）
+        assert nx_record_hint(("NX 2512 - Notepad", "notepad.exe"),
+                              not_connected, cfg, tmp) is None
+        # exe 正好是 NX 主程序（标题里没有 NX）→ 仍然提醒
+        assert nx_record_hint(("Designcenter 2512", "ugraf.exe"),
+                              not_connected, cfg, tmp) is not None
+
+        # 边界：没启用 nx 后端 / 没启用流1 / status 还没生成 / 标题命中但拿不到 exe
+        no_nx = {"stream1": {"enabled": True, "backends": ["solidworks", "creo"]},
+                 "nx": {}}
+        assert nx_record_hint(nx_window, not_connected, no_nx, tmp) is None
+        assert nx_record_hint(nx_window, not_connected,
+                              {"stream1": {"enabled": False}}, tmp) is None
+        assert nx_record_hint(("NX 2512", None), None, cfg, tmp) is not None
+        assert nx_record_hint((None, None), not_connected, cfg, tmp) is None
+        assert DEFAULT_CONFIG["nx"]["hint_when_not_recording"] is True
+        ok("NX 录制提醒规则正确（exe 优先：浏览器标题含 NX 不误报；"
+           "已连接/关配置/非 NX → 静默）")
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+
+
+# ======================================================================
+# v0.2.2 安全修复回归（2026-10-23 全程序检查：1 阻断 + 6 高危）
+# ======================================================================
+
+def test_ai_eye_capture_guard():
+    """【阻断】AI 眼隐私红线：按窗口抓画面 + 抓前/抓后双复核，绝不整屏。
+
+    - 抓取前复核不通过（切窗 / 已关闭 / exe-title 与触发时不一致）→ 跳过，
+      抓取函数 0 调用；
+    - 窗口矩形无效/最小化 → 抓取前就拒绝（抓取函数 0 调用）；
+    - 抓取后复核失败（窗口被切走）→ 丢弃图片，不保存/不上传/不回调；
+    - 正常 → 只保存窗口尺寸的图（不是整屏）。
+    全部用注入的假探测/假抓取器，不碰真实屏幕。
+    """
+    from PIL import Image
+    import ai_eye
+    from ai_eye import AiEye, window_capture_size, verify_capture_window
+
+    apps = [{"exe": "ugraf.exe", "title": "NX"}]
+    ident = {"hwnd": 4242, "title": "NX 2512", "exe": "ugraf.exe", "ts": 1}
+    good = {"alive": True, "foreground": True, "title": "NX 2512", "exe": "ugraf.exe"}
+    assert verify_capture_window(ident, apps, state=good) == (True, "")
+    # 1) 没拿到 hwnd（旧路径）→ 跳过，绝不"再读一次当前前台窗口"
+    ok_hwnd, why = verify_capture_window({"hwnd": 0, "title": "NX"}, apps, state=good)
+    assert ok_hwnd is False and "hwnd" in why, (ok_hwnd, why)
+    # 2) 目标窗口已关闭 → 跳过
+    ok_alive, why = verify_capture_window(ident, apps, state=dict(good, alive=False))
+    assert ok_alive is False and "关闭" in why, (ok_alive, why)
+    # 3) 前台已切到别的窗口 → 跳过
+    ok_fg, why = verify_capture_window(ident, apps, state=dict(good, foreground=False))
+    assert ok_fg is False and "前台" in why, (ok_fg, why)
+    # 4) 同一个 hwnd，但 exe/title 被换成浏览器 → 身份不一致（先于 CAD 判定）→ 跳过
+    bad = dict(good, exe="chrome.exe", title="NX 2406 - 百度搜索")
+    ok_cad, why = verify_capture_window(ident, apps, state=bad)
+    assert ok_cad is False and "身份" in why, (ok_cad, why)
+    # 4b) 身份一致、但不在建模软件名单里 → 不是 CAD 窗口 → 跳过
+    other_id = {"hwnd": 5151, "title": "Foo", "exe": "foo.exe"}
+    ok_notcad, why = verify_capture_window(
+        other_id, apps, state={"alive": True, "foreground": True,
+                               "title": "Foo", "exe": "foo.exe"})
+    assert ok_notcad is False and "CAD" in why, (ok_notcad, why)
+    # 5) 身份一致性：exe 没变、标题变了（换文档/弹对话框）→ 跳过
+    ok_title, why = verify_capture_window(
+        ident, apps, state=dict(good, title="NX 2512 - 零件1.prt"))
+    assert ok_title is False and "身份" in why, (ok_title, why)
+    # 6) 身份一致性：标题没变、exe 变了 → 跳过
+    ok_exe, why = verify_capture_window(ident, apps, state=dict(good, exe="ugraf2.exe"))
+    assert ok_exe is False and "身份" in why, (ok_exe, why)
+    # 7) 调试开关只放行"是不是 CAD"，**不放行身份一致性**（隐私底线）
+    non_cad_id = {"hwnd": 77, "title": "随便", "exe": "chrome.exe"}
+    non_cad_state = {"alive": True, "foreground": True,
+                     "title": "随便", "exe": "chrome.exe"}
+    assert verify_capture_window(non_cad_id, apps, state=non_cad_state)[0] is False
+    assert verify_capture_window(non_cad_id, apps, state=non_cad_state,
+                                 allow_all_windows=True) == (True, "")
+    ok_allow_identity, why = verify_capture_window(
+        ident, apps, state=bad, allow_all_windows=True)
+    assert ok_allow_identity is False and "身份" in why, (ok_allow_identity, why)
+    # 8) 纯换算：位图尺寸 = 窗口尺寸（不是整屏）；无效矩形 → None
+    assert window_capture_size((100, 100, 500, 400)) == (400, 300)
+    assert window_capture_size((0, 0, 10, 10)) is None
+
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-guard-"))
+    seq = [0]
+
+    def new_eye(results, probe, rect_probe=None, grab=None):
+        """造一个只依赖注入探测的 AiEye（fake grab/recognize，不碰真实屏幕）。"""
+        seq[0] += 1
+        calls = {"grab": 0, "grab_args": [], "recognize": 0}
+        images = tmp / f"images{seq[0]}"
+
+        def default_grab(hwnd, size):
+            calls["grab"] += 1
+            calls["grab_args"].append((hwnd, tuple(size)))
+            return Image.new("RGB", tuple(size), (10, 20, 30))
+
+        eye = AiEye({"provider": "mock", "delay_s": 0.01, "dedup_window_s": 0,
+                     "rate_per_min": 999, "save_images": True,
+                     "triggers": {"click_left": True}},
+                    on_result=lambda d, t: results.append((d, t)),
+                    is_running=lambda: True, images_dir=images,
+                    modeling_apps=apps, window_probe=probe,
+                    rect_probe=rect_probe, grab_window=grab or default_grab,
+                    scale_probe=lambda: 1.0)
+        eye._recognize = lambda job, b64: (
+            calls.__setitem__("recognize", calls["recognize"] + 1),
+            {"ok": True, "answer": {}})[1]
+        return eye, calls, images
+
+    def run(eye, ts):
+        eye.start()
+        eye.trigger("click", {"button": "left"}, ts, (10, 10), window=ident)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            st = eye.status()
+            if st["skipped"] + st["ok"] + st["fail"] >= 1:
+                break
+            time.sleep(0.02)
+        st = eye.status()
+        eye.stop()
+        return st
+
+    try:
+        def assert_skipped_without_capture(calls, st, results, images, why):
+            assert calls["grab"] == 0, f"{why}：不允许调用窗口抓取"
+            assert calls["recognize"] == 0, f"{why}：不允许上传云端"
+            assert st["skipped"] == 1 and st["ok"] == 0 and st["fail"] == 0, st
+            assert results == [], f"{why}：不允许写识别结果"
+            assert list(images.glob("*.jpg")) == [], f"{why}：不允许落图"
+
+        # A) 抓取前切窗 → 跳过（0 次抓取）
+        results = []
+        eye, calls, images = new_eye(
+            results, probe=lambda _id: dict(good, foreground=False))
+        st = run(eye, 1700000000000)
+        assert_skipped_without_capture(calls, st, results, images, "切窗")
+
+        # B) 身份不一致（同 hwnd，标题变了）→ 跳过（0 次抓取）
+        results = []
+        eye, calls, images = new_eye(
+            results, probe=lambda _id: dict(good, title="NX 2512 - 零件1.prt"))
+        st = run(eye, 1700000000001)
+        assert_skipped_without_capture(calls, st, results, images, "身份(title)不一致")
+
+        # C) 窗口矩形无效/最小化 → 抓取前拒绝（抓取函数 0 调用）
+        results = []
+        eye, calls, images = new_eye(
+            results, probe=lambda _id: good,
+            rect_probe=lambda _hwnd: (100, 100, 40, 400))
+        st = run(eye, 1700000000002)
+        assert_skipped_without_capture(calls, st, results, images, "无效矩形")
+        results = []
+        eye, calls, images = new_eye(
+            results, probe=lambda _id: good, rect_probe=lambda _hwnd: None)
+        st = run(eye, 1700000000003)
+        assert_skipped_without_capture(calls, st, results, images, "最小化/无矩形")
+
+        # D) 正常 → 只抓窗口、只存窗口尺寸图（不是整屏），前后各复核一次
+        from PIL import Image as _Image
+        results = []
+        probe_calls = []
+
+        def good_probe(_id):
+            probe_calls.append(1)
+            return good
+
+        eye, calls, images = new_eye(
+            results, probe=good_probe,
+            rect_probe=lambda _hwnd: (100, 100, 500, 400))
+        st = run(eye, 1700000000100)
+        assert calls["grab"] == 1, f"正常路径只应抓取一次: {calls}"
+        assert calls["grab_args"] == [(4242, (400, 300))], calls["grab_args"]
+        assert len(probe_calls) == 2, "抓取前后必须各复核一次窗口身份"
+        assert calls["recognize"] == 1, calls
+        assert st["ok"] == 1 and st["skipped"] == 0 and st["fail"] == 0, st
+        assert len(results) == 1, results
+        detail = results[0][0]
+        assert detail["result"]["ok"] is True
+        saved = detail["image"]
+        assert saved and Path(saved).exists(), saved
+        assert Path(saved).parent == images, saved
+        with _Image.open(saved) as im:
+            assert im.size == (400, 300), (
+                f"只保存窗口尺寸图，实际 {im.size}（整屏=桌面尺寸）")
+        assert detail["image_rel"].startswith(f"images{seq[0]}/"), detail["image_rel"]
+
+        # E) 抓取后窗口被切走 → 图丢弃：不保存、不上传、不回调
+        results = []
+        states = [good, dict(good, foreground=False)]   # 第一次=抓前，第二次=抓后
+
+        def switch_probe(_id):
+            return states.pop(0) if states else dict(good, foreground=False)
+
+        eye, calls, images = new_eye(
+            results, probe=switch_probe,
+            rect_probe=lambda _hwnd: (100, 100, 500, 400))
+        st = run(eye, 1700000000200)
+        assert calls["grab"] == 1, "抓取前复核通过，所以会抓一次（随后丢弃）"
+        assert calls["recognize"] == 0, "抓后复核失败不允许上传云端"
+        assert st["skipped"] == 1 and st["ok"] == 0 and st["fail"] == 0, st
+        assert results == [], "抓后复核失败不允许回调识别结果"
+        assert list(images.glob("*.jpg")) == [], "抓后复核失败不允许保存图片"
+
+        # F) 探测/矩形/抓取阶段抛 OSError → 统一按跳过：不计 fail、不回调、不保存
+        results = []
+
+        def broken_probe(_id):
+            raise OSError("probe 抓前探测失败（测试模拟）")
+
+        eye, calls, images = new_eye(
+            results, probe=broken_probe,
+            rect_probe=lambda _hwnd: (100, 100, 500, 400))
+        st = run(eye, 1700000000300)
+        assert_skipped_without_capture(calls, st, results, images, "抓前探测异常")
+
+        # 抓后探测抛 OSError → 已抓的图丢弃，不算 fail、不回调
+        results = []
+        post_probes = [good]
+
+        def post_broken_probe(_id):
+            if post_probes:
+                return post_probes.pop(0)
+            raise OSError("probe 抓后探测失败（测试模拟）")
+
+        eye, calls, images = new_eye(
+            results, probe=post_broken_probe,
+            rect_probe=lambda _hwnd: (100, 100, 500, 400))
+        st = run(eye, 1700000000301)
+        assert calls["grab"] == 1, "抓前复核通过后会抓一次（随后丢弃）"
+        assert calls["recognize"] == 0, "抓后探测异常不允许上传云端"
+        assert st["skipped"] == 1 and st["ok"] == 0 and st["fail"] == 0, st
+        assert results == [], "抓后探测异常不允许回调识别结果"
+        assert list(images.glob("*.jpg")) == [], "抓后探测异常不允许保存图片"
+
+        # 矩形探测抛 OSError → 抓取前跳过（抓取函数 0 调用）
+        results = []
+
+        def broken_rect(_hwnd):
+            raise OSError("矩形探测失败（测试模拟）")
+
+        eye, calls, images = new_eye(
+            results, probe=lambda _id: good, rect_probe=broken_rect)
+        st = run(eye, 1700000000302)
+        assert_skipped_without_capture(calls, st, results, images, "矩形探测异常")
+
+        # 抓取函数抛 OSError → 跳过（不能变成 fail/回调）
+        results = []
+
+        def broken_grab(_hwnd, _size):
+            raise OSError("窗口抓取失败（测试模拟）")
+
+        eye, calls, images = new_eye(
+            results, probe=lambda _id: good,
+            rect_probe=lambda _hwnd: (100, 100, 500, 400),
+            grab=broken_grab)
+        st = run(eye, 1700000000303)
+        assert calls["recognize"] == 0, calls
+        assert st["skipped"] == 1 and st["ok"] == 0 and st["fail"] == 0, st
+        assert results == [], "抓取异常不允许回调识别结果"
+        assert list(images.glob("*.jpg")) == [], "抓取异常不允许保存图片"
+
+        # G) 源码契约：不再有整屏截图/裁剪路径，必须用 PrintWindow 按窗口抓
+        src = (Path(APP_DIR) / "ai_eye.py").read_text(encoding="utf-8")
+        assert "from PIL import ImageGrab" not in src, "不得再整屏截图"
+        assert "ImageGrab.grab(" not in src, "不得再整屏 grab"
+        assert ".crop(" not in src, "不得再有'整屏 grab 再裁剪'路径"
+        assert "PrintWindow" in src, "必须按窗口抓取画面（PrintWindow）"
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("AI 眼按窗口抓取 + 抓前/抓后双复核（切窗/身份不一致/无效矩形→0 次抓取；"
+       "抓后切窗→丢弃；探测/矩形/抓取 OSError→跳过不回调；正常→只存窗口尺寸图）")
+
+
+def test_config_env_key_not_persisted():
+    """【高危 2】AI_EYE_KEY：只在运行时生效，绝不落盘、不污染 DEFAULT_CONFIG。"""
+    old = os.environ.get("AI_EYE_KEY")
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-envkey-"))
+    try:
+        os.environ["AI_EYE_KEY"] = "sk-env-secret-123"
+        mgr = ConfigManager(tmp)
+        cfg = mgr.load()
+        assert cfg["ai_eye"]["api_key"] == "sk-env-secret-123", cfg["ai_eye"]
+        assert mgr.env_key_active is True
+        assert DEFAULT_CONFIG["ai_eye"]["api_key"] == "", \
+            "DEFAULT_CONFIG 不能被环境密钥污染（浅复制 bug 回归）"
+        # ensure_file / load 写出的 config.json 里不能有环境密钥
+        text = (tmp / "config.json").read_text(encoding="utf-8")
+        assert "sk-env-secret-123" not in text, "ensure_file 不得写出环境密钥"
+        # 设置界面保存（把带环境密钥的运行值传进去）→ 文件里仍不能有它
+        cfg["idle_minutes"] = 3.5
+        mgr.save(cfg)
+        text = (tmp / "config.json").read_text(encoding="utf-8")
+        assert "sk-env-secret-123" not in text, "设置保存不得写回环境密钥"
+        saved = json.loads(text)
+        assert saved["ai_eye"]["api_key"] == ""
+        assert saved["idle_minutes"] == 3.5
+        # 深拷贝：改返回值不影响默认配置（嵌套列表 modeling_apps 也不能共享引用）
+        cfg["ai_eye"]["api_key"] = "changed"
+        assert DEFAULT_CONFIG["ai_eye"]["api_key"] == ""
+        merged = ConfigManager._merge(DEFAULT_CONFIG, {"modeling_apps": []})
+        assert merged["modeling_apps"] == []
+        assert DEFAULT_CONFIG["modeling_apps"], "合并不能把默认名单清空"
+
+        # 文件里原本有用户 key：环境变量生效时保存要保留文件原值（不写环境密钥）
+        tmp2 = Path(tempfile.mkdtemp(prefix="cad-ai-envkey2-"))
+        try:
+            (tmp2 / "config.json").write_text(json.dumps(
+                {"ai_eye": {"api_key": "file-key-999"}}), encoding="utf-8")
+            mgr2 = ConfigManager(tmp2)
+            cfg2 = mgr2.load()
+            assert cfg2["ai_eye"]["api_key"] == "sk-env-secret-123"
+            assert mgr2.file_api_key == "file-key-999"
+            mgr2.save(cfg2)
+            saved2 = json.loads((tmp2 / "config.json").read_text(encoding="utf-8"))
+            assert saved2["ai_eye"]["api_key"] == "file-key-999", saved2["ai_eye"]
+        finally:
+            shutil.rmtree(str(tmp2), ignore_errors=True)
+
+        # 取消环境变量后：正常从文件读，保存界面值也正常写
+        os.environ.pop("AI_EYE_KEY", None)
+        mgr3 = ConfigManager(tmp)
+        cfg3 = mgr3.load()
+        assert mgr3.env_key_active is False
+        cfg3["ai_eye"]["api_key"] = "user-typed-key"
+        mgr3.save(cfg3)
+        assert json.loads((tmp / "config.json").read_text(
+            encoding="utf-8"))["ai_eye"]["api_key"] == "user-typed-key"
+    finally:
+        if old is None:
+            os.environ.pop("AI_EYE_KEY", None)
+        else:
+            os.environ["AI_EYE_KEY"] = old
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("AI_EYE_KEY 只用于运行时（load 可见 / 不污染默认值 / 文件与设置保存都不落盘）")
+
+
+def test_nx_journal_dir_same_source():
+    """【高危 3】NX 日志目录同源：桥默认目录 == 提醒 journal_dir == <data_dir>\\journals。"""
+    from collector_core import nx_journal_dir
+    from nx_bridge import NxBridge
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-nxdir-"))
+    try:
+        data_dir = tmp / "my_data"      # 故意不是仓库 data\（模拟打包/自定义数据目录）
+        (data_dir / "journals").mkdir(parents=True)
+        expected = data_dir / "journals"
+        assert nx_journal_dir(data_dir) == expected
+        # 桥默认目录：显式传 data_dir → 和界面按钮同一个
+        bridge = NxBridge({"data_dir": str(data_dir)},
+                          lambda *a: None, lambda: False)
+        assert bridge.data_dir == str(data_dir)
+        assert str(expected) in bridge._dirs(), bridge._dirs()
+        assert Path(bridge.status()["journal_dir"]) == expected, bridge.status()
+        # 提醒里的 journal_dir 与按钮/桥同源
+        hint = nx_record_hint(
+            ("Designcenter NX 2512", "ugraf.exe"),
+            [{"backend": "nx", "connected": False}],
+            {"stream1": {"enabled": True, "backends": ["nx"]},
+             "nx": {"hint_when_not_recording": True}},
+            data_dir)
+        assert hint and Path(hint["journal_dir"]) == expected, hint
+        # 没配显式 journal_dirs 时，桥的最后兜底候选就是 <data_dir>\journals
+        # （以前是源码仓库 data\journals → 打包后和按钮指向两个文件夹）
+        src = (Path(APP_DIR) / "input_listener.py").read_text(encoding="utf-8")
+        assert 'nx_cfg["data_dir"] = str(self.data_dir)' in src, \
+            "input_listener 创建 NxBridge 时必须传实际数据根目录"
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("NX 日志目录同源（桥默认 / 按钮 / 提醒 = <data_dir>\\journals）")
+
+
+def test_nx_bridge_data_dir_wired():
+    """【高危 3】会话启动时把**实际数据根目录**传给 NX 桥（真实接线验证）。"""
+    tmp = tempfile.mkdtemp(prefix="cad-ai-nxwire-")
+    (Path(tmp) / "journals").mkdir()
+    with open(os.path.join(tmp, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "version": 2,
+            "idle_minutes": 10.0,
+            "modeling_apps": TEST_ONLY_APPS,
+            "stream1": {"enabled": True, "backends": ["nx"]},
+            "nx": {"poll_interval_s": 0.2},
+        }, f, ensure_ascii=False, indent=2)
+    session = CollectorSession(tmp)
+    session.start()
+    try:
+        assert session.stream1s, "应启动 NX 桥"
+        bridge = session.stream1s[0]
+        assert bridge.cfg.get("data_dir") == str(Path(tmp)), bridge.cfg
+        expected = Path(tmp) / "journals"
+        assert str(expected) in bridge._dirs(), bridge._dirs()
+        assert str(session.data_dir / "journals") == str(expected)
+    finally:
+        session.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+    ok("会话把实际数据根目录传给 NX 桥（桥默认目录 == 会话数据根\\journals）")
+
+
+def test_write_failure_keeps_session():
+    """【高危 4】写库失败被吞：error 非空、内容计数不加、会话保留、status=error。"""
+    tmp = tempfile.mkdtemp(prefix="cad-ai-wfail-")
+    session = _mk_session_v4(tmp)      # 测试专用假建模名单 + 流1 关闭
+    session.start()
+    try:
+        def boom(*args, **kwargs):
+            raise OSError("磁盘写满（测试模拟）")
+
+        assert session._content_events == 0
+        session.store.add_event = boom      # 让本会话之后的事件全写失败
+        session._record("stream2", "click", {"button": "left", "action": "press",
+                                             "x": 1, "y": 2})
+        session._record("stream2", "key_down", {"char": "a"})
+        assert session.error and "写库失败" in session.error, session.error
+        assert session._content_events == 0, "写失败不能算内容事件（否则空会话删不掉/计数错位）"
+        assert session.stats()["write_failed"] is True
+    finally:
+        summary = session.stop()
+    assert summary is not None
+    assert summary["counts"]["stream2"] == 0, summary["counts"]
+    assert summary["status"] == "error", summary
+    assert summary["error"] and "写库失败" in summary["error"], summary
+    assert summary["kept"] is True, "写库失败绝不能当空会话删掉"
+    session_dir = Path(summary["session_dir"])
+    assert session_dir.is_dir(), "写库失败的会话文件夹必须保留"
+    meta = read_session_json(session_dir)
+    assert meta and meta["status"] == "error", meta
+    assert meta.get("error"), meta
+    shutil.rmtree(tmp, ignore_errors=True)
+    ok("写库失败被正确上报（error / 会话保留 / session.json status=error）")
+
+
+def test_sw_com_disconnect_reconnect():
+    """【高危 5】SolidWorks COM 断线：区分"没文档"与"COM 异常"，断开重连不误报删除。"""
+    from solidworks_bridge import (ComSnapshotError, SolidWorksBridge,
+                                   _get_com_member, snapshot_sw)
+
+    class _FakeFeature:
+        def __init__(self, name, ftype="Boss", sup=0):
+            self.Name = name
+            self.GetTypeName2 = ftype
+            self.GetSuppression2 = sup
+
+        def GetFirstSubFeature(self):
+            return None
+
+        def GetNextFeature(self):
+            return None
+
+    class _FakeModel:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def GetTitle(self):
+            return "Part1"
+
+        def GetType(self):
+            return 1
+
+        @property
+        def SelectionManager(self):
+            return None
+
+        @property
+        def FirstFeature(self):
+            return self._owner.first_feature
+
+    class _FakeSw:
+        def __init__(self):
+            self.fail = False
+            self.fail_reason = "RPC server unavailable（测试模拟 COM 断线）"
+            self.first_feature = _FakeFeature("Boss-Extrude1")
+            self.doc = _FakeModel(self)
+
+        @property
+        def ActiveDoc(self):
+            if self.fail:
+                raise RuntimeError(self.fail_reason)
+            return self.doc
+
+    fake = _FakeSw()
+    # 1) 正常抓拍
+    snap = snapshot_sw(fake, strict=True)
+    assert snap["doc"] == {"title": "Part1", "type": 1}, snap
+    assert [f["path"] for f in snap["features"]] == ["Boss-Extrude1"], snap
+    # 2) "没有活动文档"是正常状态：doc=None，不抛异常
+    fake.doc = None
+    soft_no_doc = snapshot_sw(fake, strict=True)
+    assert soft_no_doc["doc"] is None and soft_no_doc["features"] == []
+    fake.doc = _FakeModel(fake)
+    # 3) COM 异常：strict 必须抛（不能假装"没文档"）；非 strict 保持旧行为
+    fake.fail = True
+    try:
+        snapshot_sw(fake, strict=True)
+    except ComSnapshotError as exc:
+        assert "ActiveDoc" in str(exc), exc
+    else:
+        raise AssertionError("COM 异常必须抛 ComSnapshotError，不能吞成空快照")
+    soft = snapshot_sw(fake, strict=False)
+    assert soft["doc"] is None and soft["features"] == []
+    fake.fail = False
+
+    # 4) 桥：断线 → connected False + 释放 COM 对象；恢复 → 重连；全程无假删除事件
+    events = []
+    bridge = SolidWorksBridge({"poll_interval_s": 0.01},
+                              lambda kind, detail: events.append((kind, detail)),
+                              lambda: True)
+    connect_calls = {"n": 0}
+
+    def fake_connect(_client):
+        connect_calls["n"] += 1
+        return fake
+
+    bridge._connect = fake_connect      # 不碰真实 COM
+    sw = bridge._tick(None, object())   # 首轮：连上 + 抓基准，不产生事件
+    assert sw is fake and bridge.status()["connected"] is True, bridge.status()
+    assert events == [], events
+    sw = bridge._tick(sw, object())     # 正常轮询：没变化 → 无事件
+    assert sw is fake and events == [], events
+    fake.fail = True                    # COM 断线
+    sw = bridge._tick(sw, object())
+    st = bridge.status()
+    assert sw is None, "断线必须释放 COM 对象（sw=None），下一轮重连"
+    assert st["connected"] is False and st["retrying"] is True, st
+    assert "COM" in (st.get("last_error") or ""), st
+    assert events == [], f"断线不能产生假的文档/特征删除事件: {events}"
+    fake.fail = False                   # SW 恢复
+    sw = bridge._tick(None, object())   # 重新 GetActiveObject + 重抓基准
+    assert sw is fake and bridge.status()["connected"] is True, bridge.status()
+    assert connect_calls["n"] == 2, connect_calls
+    sw = bridge._tick(sw, object())
+    assert events == [], f"重连后第一轮只抓基准，不能误报变化: {events}"
+    fake.first_feature = None           # 恢复后真有变化 → 照常产出事件
+    bridge._tick(sw, object())
+    assert "featureRemoved" in [k for k, _ in events], events
+
+    # 5) 【第三轮阻断回归】选中对象没有 Name 成员（pywin32 抛 AttributeError）
+    #    属于正常缺成员 → 快照继续有效（name=None），不能当 COM 断线。
+    class _SelectedNoName:
+        @property
+        def Name(self):
+            raise AttributeError("IFace2.Name")
+
+    class _SelectedUnknownName:
+        @property
+        def Name(self):
+            # pywin32 另一种"没这个成员"：DISP_E_UNKNOWNNAME
+            raise RuntimeError("(-2147352570, 'Unknown name.', None, None)")
+
+    class _SelectedRpcBroken:
+        @property
+        def Name(self):
+            raise RuntimeError("RPC server unavailable（测试模拟调用故障）")
+
+    class _SelManager:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def GetSelectedObjectCount2(self, _flag):
+            return 1
+
+        def GetSelectedObject6(self, _i, _flag):
+            return self._owner.selected
+
+        def GetSelectedObjectType3(self, _i, _flag):
+            return 3
+
+    class _SelModel:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def GetTitle(self):
+            return "Part1"
+
+        def GetType(self):
+            return 1
+
+        @property
+        def SelectionManager(self):
+            return _SelManager(self._owner)
+
+        @property
+        def FirstFeature(self):
+            return None
+
+    class _SelSw:
+        def __init__(self):
+            self.selected = _SelectedNoName()
+            self.doc = _SelModel(self)
+
+        @property
+        def ActiveDoc(self):
+            return self.doc
+
+    sel_fake = _SelSw()
+    sel_snap = snapshot_sw(sel_fake, strict=True)
+    assert sel_snap["doc"] == {"title": "Part1", "type": 1}, sel_snap
+    assert sel_snap["selection"] == [{"type": 3, "name": None}], sel_snap
+    # DISP_E_UNKNOWNNAME 类"没这个成员"同样算正常缺失
+    sel_fake.selected = _SelectedUnknownName()
+    assert snapshot_sw(sel_fake, strict=True)["selection"] == [
+        {"type": 3, "name": None}], "DISP_E_UNKNOWNNAME 应视为可选成员缺失"
+
+    # 可选成员读取遇到**真正的**调用故障（不是"没这个成员"）→ 仍按断线
+    sel_fake.selected = _SelectedRpcBroken()
+    try:
+        snapshot_sw(sel_fake, strict=True)
+    except ComSnapshotError as exc:
+        assert "Name" in str(exc), exc
+    else:
+        raise AssertionError(
+            "可选成员读取遇到真 COM 故障（RPC 不可达）必须抛 ComSnapshotError")
+
+    # 必选成员缺失仍按断线处理：可选成员的 AttributeError 豁免不能扩散到必选成员
+    class _RequiredMemberMissing:
+        @property
+        def ActiveDoc(self):
+            raise AttributeError("ISldWorks.ActiveDoc")
+
+    try:
+        snapshot_sw(_RequiredMemberMissing(), strict=True)
+    except ComSnapshotError as exc:
+        assert "ActiveDoc" in str(exc), exc
+    else:
+        raise AssertionError("必选成员缺失必须按断线处理（不能套用可选成员豁免）")
+
+    # 桥：正常基准（Name 缺失）→ 真故障断线 → 恢复后重连重建基准，无假事件
+    sel_events = []
+    sel_bridge = SolidWorksBridge({"poll_interval_s": 0.01},
+                                  lambda kind, detail: sel_events.append((kind, detail)),
+                                  lambda: True)
+    sel_bridge._connect = lambda _client: sel_fake
+    sel_fake.selected = _SelectedNoName()
+    sw2 = sel_bridge._tick(None, object())
+    st = sel_bridge.status()
+    assert sw2 is sel_fake and st["connected"] is True, st
+    sel_fake.selected = _SelectedRpcBroken()
+    sw2 = sel_bridge._tick(sw2, object())
+    st = sel_bridge.status()
+    assert sw2 is None and st["connected"] is False, st
+    assert sel_events == [], f"真 COM 故障不能产生假事件: {sel_events}"
+    sel_fake.selected = _SelectedNoName()
+    sw2 = sel_bridge._tick(None, object())   # 下轮重连 + 重建基准
+    st = sel_bridge.status()
+    assert sw2 is sel_fake and st["connected"] is True and st["retrying"] is False, st
+    sel_bridge._tick(sw2, object())
+    assert sel_events == [], f"重连后第一轮只抓基准，不能误报变化: {sel_events}"
+
+    # 6) 【第四轮阻断回归】必选成员 ActiveDoc 抛 DISP_E_MEMBERNOTFOUND
+    #    （"Member not found" / -2147352573）→ strict 必须断线；不能吞成
+    #    doc=None（否则基准正常后会产出假 documentActivated(cur=None)）。
+    fake.fail_reason = ("(-2147352573, 'Member not found.', None, None)"
+                        "（测试模拟 DISP_E_MEMBERNOTFOUND）")
+    fake.fail = True
+    try:
+        snapshot_sw(fake, strict=True)
+    except ComSnapshotError as exc:
+        assert "ActiveDoc" in str(exc), exc
+    else:
+        raise AssertionError(
+            "必选成员 Member not found 必须抛 ComSnapshotError，不能吞成空快照")
+    soft_member_missing = snapshot_sw(fake, strict=False)   # 宽松模式保持旧行为
+    assert soft_member_missing["doc"] is None, soft_member_missing
+
+    mm_events = []
+    mm_bridge = SolidWorksBridge({"poll_interval_s": 0.01},
+                                 lambda kind, detail: mm_events.append((kind, detail)),
+                                 lambda: True)
+    mm_bridge._connect = lambda _client: fake
+    fake.fail = False                       # 先建一个正常基准
+    fake.fail_reason = "RPC server unavailable（测试模拟 COM 断线）"
+    sw3 = mm_bridge._tick(None, object())
+    st = mm_bridge.status()
+    assert sw3 is fake and st["connected"] is True, st
+    assert mm_events == [], mm_events
+    fake.fail_reason = ("(-2147352573, 'Member not found.', None, None)"
+                        "（测试模拟 DISP_E_MEMBERNOTFOUND）")
+    fake.fail = True
+    sw3 = mm_bridge._tick(sw3, object())
+    st = mm_bridge.status()
+    assert sw3 is None, "必选成员缺失必须释放实例（sw=None）"
+    assert st["connected"] is False and st["retrying"] is True, st
+    assert mm_events == [], f"不能产生假 documentActivated/feature 事件: {mm_events}"
+    fake.fail = False                       # 恢复 → 重连 + 重建基准，无假事件
+    sw3 = mm_bridge._tick(None, object())
+    st = mm_bridge.status()
+    assert sw3 is fake and st["connected"] is True and st["retrying"] is False, st
+    mm_bridge._tick(sw3, object())
+    assert mm_events == [], f"重连后第一轮只抓基准，不能误报变化: {mm_events}"
+    # 调用路径的"伪可调用属性"语义保持不变：getattr 拿到的是 pywin32 的
+    # COM dispatch 对象、调用时报 member-not-found → 直接把属性值交出去。
+    # （只对真 COM 对象放行；普通方法失败必须断线，见下一条断言。）
+    class _PseudoCallable:
+        _oleobj_ = object()   # 模拟 pywin32 dispatch 对象的内部标记
+
+        def __call__(self):
+            raise RuntimeError("Member not found（伪可调用属性，测试模拟）")
+
+    class _PseudoHost:
+        Pseudo = _PseudoCallable()
+
+    pseudo_host = _PseudoHost()
+    got_pseudo = _get_com_member(pseudo_host, "Pseudo", strict=True)
+    assert got_pseudo is pseudo_host.Pseudo, (
+        "调用路径的伪可调用属性语义不能变（member-not-found 时返回属性本身）")
+
+    # 必选"方法"调用失败不能被伪可调用豁免吞掉：普通方法调用报
+    # Member not found 必须抛 ComSnapshotError（否则断线被吞、产生假事件）。
+    class _MethodHost:
+        def GetTitle(self):
+            raise RuntimeError("(-2147352573, 'Member not found.', None, None)")
+
+    try:
+        _get_com_member(_MethodHost(), "GetTitle", strict=True)
+    except ComSnapshotError:
+        pass
+    else:
+        raise AssertionError("必选方法 Member not found 必须抛 ComSnapshotError")
+
+    ok("SW COM 断线正确重连（没文档≠断线；断线释放对象；不产生假删除事件；"
+       "选中对象缺 Name 不算断线、真 RPC 故障仍断线；必选成员 Member not found 仍断线；"
+       "伪可调用属性语义不变）")
+
+
+def test_sw_feature_traversal_error_disconnects():
+    """【P1 回归】特征遍历中途 COM 异常 → 整次快照作废 + 断线重连，无假事件。
+
+    以前 GetNextFeature/子特征遍历的异常被吞成"特征没了"：connected 仍 True、
+    实例不释放，还会拿**不完整特征树**差分出假的 featureRemoved/featureAdded。
+    现在 strict 快照里任何一次 COM 读取失败都抛 ComSnapshotError，桥按断线处理。
+    """
+    from solidworks_bridge import (ComSnapshotError, SolidWorksBridge,
+                                   snapshot_sw)
+
+    class _FakeFeature:
+        def __init__(self, name, next_feature=None):
+            self.Name = name
+            self.GetTypeName2 = "Boss"
+            self.GetSuppression2 = 0
+            self.next_feature = next_feature
+            self.fail_next = False
+
+        def GetFirstSubFeature(self):
+            return None
+
+        def GetNextFeature(self):
+            if self.fail_next:
+                raise RuntimeError(
+                    "RPC server unavailable（测试模拟 GetNextFeature 中断线）")
+            return self.next_feature
+
+    class _FakeModel:
+        def __init__(self, owner):
+            self._owner = owner
+
+        def GetTitle(self):
+            return "Part1"
+
+        def GetType(self):
+            return 1
+
+        @property
+        def SelectionManager(self):
+            return None
+
+        @property
+        def FirstFeature(self):
+            return self._owner.first_feature
+
+    class _FakeSw:
+        def __init__(self):
+            self.first_feature = None
+            self.doc = _FakeModel(self)
+
+        @property
+        def ActiveDoc(self):
+            return self.doc
+
+    feat_b = _FakeFeature("Cut-Extrude1")
+    feat_a = _FakeFeature("Boss-Extrude1", feat_b)
+    fake = _FakeSw()
+    fake.first_feature = feat_a
+
+    # 1) 正常：整棵特征树都能读出来
+    snap = snapshot_sw(fake, strict=True)
+    assert [f["path"] for f in snap["features"]] == ["Boss-Extrude1", "Cut-Extrude1"], snap
+    # 2) 第二棵特征 GetNextFeature 抛异常 → strict 必须抛 ComSnapshotError
+    feat_b.fail_next = True
+    try:
+        snapshot_sw(fake, strict=True)
+    except ComSnapshotError as exc:
+        assert "GetNextFeature" in str(exc), exc
+    else:
+        raise AssertionError("特征遍历 COM 异常必须抛 ComSnapshotError，"
+                             "不能吞成不完整快照")
+    # 非 strict（联调脚本用）保持宽松：不抛，只拿读到的部分
+    soft = snapshot_sw(fake, strict=False)
+    assert [f["path"] for f in soft["features"]] == ["Boss-Extrude1",
+                                                     "Cut-Extrude1"], soft
+    feat_b.fail_next = False
+
+    # 3) 桥：连上并抓基准 → 特征遍历中途异常 → connected=False、释放实例、无假事件
+    events = []
+    bridge = SolidWorksBridge({"poll_interval_s": 0.01},
+                              lambda kind, detail: events.append((kind, detail)),
+                              lambda: True)
+    connect_calls = {"n": 0}
+
+    def fake_connect(_client):
+        connect_calls["n"] += 1
+        return fake
+
+    bridge._connect = fake_connect
+    sw = bridge._tick(None, object())        # 首轮：连上 + 抓基准
+    assert sw is fake and bridge.status()["connected"] is True, bridge.status()
+    assert events == [], events
+    feat_b.fail_next = True                  # 遍历到第二棵特征时 COM 异常
+    sw = bridge._tick(sw, object())
+    st = bridge.status()
+    assert sw is None, "特征遍历 COM 异常必须释放实例（sw=None）"
+    assert st["connected"] is False and st["retrying"] is True, st
+    assert "COM" in (st.get("last_error") or ""), st
+    assert events == [], f"残缺特征树绝不能差分出假事件: {events}"
+    # 4) SW 恢复 → 下轮重连并重建基准，不误报
+    feat_b.fail_next = False
+    sw = bridge._tick(None, object())
+    st = bridge.status()
+    assert sw is fake and st["connected"] is True and st["retrying"] is False, st
+    assert connect_calls["n"] == 2, connect_calls
+    sw = bridge._tick(sw, object())
+    assert events == [], f"重连后第一轮只抓基准，不能误报变化: {events}"
+    # 5) 恢复后真有变化 → 照常产出事件（说明重连后的差分是正常工作的）
+    fake.first_feature = None
+    bridge._tick(sw, object())
+    assert "featureRemoved" in [k for k, _ in events], events
+    ok("SW 特征遍历中途 COM 异常 → 快照作废/断线重连（connected=False、无假事件、恢复后重建基准）")
+
+
+def test_integration_scripts_only_close_owned():
+    """【高危 6 + 第四轮回归】真机联调脚本只关自己启动的实例。
+
+    行为验证：
+    - `selftest_nx.close_started`：只按 /PID 结束，绝不按镜像名全杀；
+    - `selftest_solidworks` / `selftest_production`：假 COM + 假 subprocess →
+      用户实例不被 ExitApp；自己 Popen 的 PID 被 taskkill /PID /T /F；
+      生产脚本 connect_sw 确实返回自己 Popen 的进程对象；
+    - 源码契约：四个 SW 联调/探测脚本 AST 级均无 `.ExitApp(` 调用。
+    （几个脚本已改为惰性导入 COM/安装发现，CI 也能 import。）
+    """
+    import selftest_nx
+    calls = []
+    real_run = selftest_nx.subprocess.run
+
+    class _FakeProc:
+        pid = 424242
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return None
+
+    try:
+        # 模块对象是共享的：先换成假 run，用完必须还原
+        selftest_nx.subprocess.run = fake_run
+        assert selftest_nx.close_started(None) is False, "没启动过就什么都不该做"
+        assert calls == [], calls
+        assert selftest_nx.close_started(_FakeProc()) is True
+    finally:
+        selftest_nx.subprocess.run = real_run
+    assert calls and calls[0][0] == "taskkill", calls
+    assert "/PID" in calls[0] and "424242" in calls[0], calls
+    assert "/IM" not in calls[0], f"不能按镜像名全杀: {calls[0]}"
+
+    for name in ("selftest_nx.py", "selftest_creo.py", "selftest_solidworks.py",
+                 "selftest_production.py", "probe_sw_shortcuts.py",
+                 "probe_sw_shortcuts2.py"):
+        src = (Path(APP_DIR) / name).read_text(encoding="utf-8")
+        for line in src.splitlines():
+            assert not ("taskkill" in line and "/IM" in line), \
+                f"{name}: 禁止按镜像名全杀: {line.strip()}"
+        assert "close_started(" in src, f"{name} 应使用 close_started 只关自己启动的进程"
+        assert '["taskkill", "/PID"' in src, f"{name} 必须按 PID 结束进程"
+
+    # ---- SolidWorks 联调脚本：行为测试（假 COM + 假 subprocess） ----
+    # 关键回归：launched=True 不能证明 COM 实例归属 → 绝不能 ExitApp 用户实例；
+    # 只关自己 Popen 的 PID（taskkill /PID <pid> /T /F）。
+    import ast
+    import contextlib
+    import io
+    import selftest_solidworks as sw_live   # 已改为惰性导入 COM，CI 也能 import
+    sw_calls = []
+    real_sw_run = sw_live.subprocess.run
+
+    class _FakeSwProc:
+        pid = 424243
+
+    class _FakeComInstance:
+        def __init__(self):
+            self.exit_calls = 0
+
+        def ExitApp(self):
+            self.exit_calls += 1
+            raise AssertionError("绝不能调用 COM ExitApp 关闭实例（可能关掉用户实例）")
+
+    def fake_sw_run(args, **kwargs):
+        sw_calls.append(list(args))
+        return None
+
+    fake_com = _FakeComInstance()
+    try:
+        sw_live.subprocess.run = fake_sw_run
+        with contextlib.redirect_stdout(io.StringIO()):   # 脚本的提示文字不混进自检输出
+            # 1) 用户原本就开着的实例（没有自己 Popen 的 PID）→ 什么都不动
+            assert sw_live.cleanup_after_test(fake_com, None) is False
+            assert sw_calls == [], f"不属于自己启动的实例不能杀: {sw_calls}"
+            assert fake_com.exit_calls == 0
+            # 2) 自己 Popen 的进程 → 只按 PID 关，绝不碰 COM 实例
+            assert sw_live.cleanup_after_test(fake_com, _FakeSwProc()) is True
+            assert fake_com.exit_calls == 0, "COM 实例（可能是用户的）绝不能被 ExitApp"
+    finally:
+        sw_live.subprocess.run = real_sw_run
+    assert sw_calls, "自己 Popen 的 PID 应该被 taskkill"
+    assert sw_calls[0][0] == "taskkill", sw_calls
+    assert "/PID" in sw_calls[0] and "424243" in sw_calls[0], sw_calls
+    assert "/T" in sw_calls[0] and "/F" in sw_calls[0], sw_calls
+    assert "/IM" not in sw_calls[0], f"不能按镜像名全杀: {sw_calls[0]}"
+
+    # ---- 生产联调脚本（selftest_production.py）：Popen 记 PID + 只按 PID 关 ----
+    import selftest_production as prod_live   # 已改为惰性导入 COM，CI 也能 import
+    prod_calls = []
+    real_prod_run = prod_live.subprocess.run
+    real_prod_popen = prod_live.subprocess.Popen
+    real_prod_sleep = prod_live.time.sleep
+    real_prod_win32com = prod_live._win32com
+    real_prod_prog_ids = prod_live._prog_ids
+    real_prod_sw_exe = prod_live._sw_exe
+
+    class _FakeProdSw:
+        pass
+
+    fake_prod_sw = _FakeProdSw()
+
+    class _FakeProdComClient:
+        """第一次 GetActiveObject 失败（SW 没开）→ 脚本 Popen；第二次成功。"""
+
+        def __init__(self):
+            self.get_calls = 0
+
+        def GetActiveObject(self, _pid):
+            self.get_calls += 1
+            if self.get_calls == 1:
+                raise RuntimeError("SolidWorks 未运行（测试模拟）")
+            return fake_prod_sw
+
+    class _FakeProdProc:
+        pid = 424244
+
+    popen_args = []
+
+    def fake_popen(args, **kwargs):
+        popen_args.append(list(args))
+        return _FakeProdProc()
+
+    def fake_prod_run(args, **kwargs):
+        prod_calls.append(list(args))
+        return None
+
+    try:
+        prod_live.subprocess.run = fake_prod_run
+        prod_live.subprocess.Popen = fake_popen
+        prod_live.time.sleep = lambda _s: None
+        prod_live._win32com = lambda: _FakeProdComClient()
+        prod_live._prog_ids = lambda: ["SldWorks.Application"]
+        prod_live._sw_exe = lambda: sys.executable   # 存在的文件，不需要真装 SW
+        with contextlib.redirect_stdout(io.StringIO()):
+            got_sw, got_proc = prod_live.connect_sw()
+    finally:
+        prod_live.subprocess.run = real_prod_run
+        prod_live.subprocess.Popen = real_prod_popen
+        prod_live.time.sleep = real_prod_sleep
+        prod_live._win32com = real_prod_win32com
+        prod_live._prog_ids = real_prod_prog_ids
+        prod_live._sw_exe = real_prod_sw_exe
+    assert got_sw is fake_prod_sw, got_sw
+    assert got_proc is not None and got_proc.pid == 424244, got_proc
+    assert popen_args == [[sys.executable]], popen_args
+
+    class _FakeProdCom:
+        def __init__(self):
+            self.exit_calls = 0
+
+        def ExitApp(self):
+            self.exit_calls += 1
+            raise AssertionError("绝不能调用 COM ExitApp 关闭实例")
+
+    fake_prod_com = _FakeProdCom()
+    try:
+        prod_live.subprocess.run = fake_prod_run
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert prod_live.cleanup_after_test(fake_prod_com, None) is False
+            assert prod_calls == [], f"用户实例不能杀: {prod_calls}"
+            assert fake_prod_com.exit_calls == 0
+            assert prod_live.cleanup_after_test(fake_prod_com, got_proc) is True
+            assert fake_prod_com.exit_calls == 0, "COM 实例（可能是用户的）绝不能被 ExitApp"
+    finally:
+        prod_live.subprocess.run = real_prod_run
+    assert prod_calls and prod_calls[0][0] == "taskkill", prod_calls
+    assert "/PID" in prod_calls[0] and "424244" in prod_calls[0], prod_calls
+    assert "/T" in prod_calls[0] and "/F" in prod_calls[0], prod_calls
+    assert "/IM" not in prod_calls[0], f"不能按镜像名全杀: {prod_calls[0]}"
+
+    # 源码契约（AST 级）：这四个脚本一个 ExitApp 调用都不许有
+    # （注释/docstring 里解释"为什么不用"不算调用）。
+    for name in ("selftest_solidworks.py", "selftest_production.py",
+                 "probe_sw_shortcuts.py", "probe_sw_shortcuts2.py"):
+        src = (Path(APP_DIR) / name).read_text(encoding="utf-8")
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr == "ExitApp":
+                raise AssertionError(
+                    f"{name}:{node.lineno} 仍在调用 COM ExitApp；"
+                    "只允许 taskkill /PID 关自己 Popen 的进程")
+        assert "cleanup_after_test(" in src, f"{name} 应使用 cleanup_after_test 收尾"
+    ok("联调脚本只关自己启动的实例（只 taskkill /PID；四个 SW 脚本均无 ExitApp 调用；"
+       "生产脚本 connect_sw 返回自己 Popen 的 PID）")
+
+
 # CI 上能跑的"确定性"子集：不装钩子、不注入输入、不截图、不依赖本机装了哪家 CAD。
 # 用法：python app\selftest.py --ci   （GitHub Actions 就是这么跑的）
 CI_SAFE_TESTS = [
@@ -1224,7 +2473,16 @@ CI_SAFE_TESTS = [
     test_reconcile,
     test_reconcile_stream1_guard,
     test_nx_journal_bridge,
+    test_nx_record_hint,
     test_cad_discovery,
+    # v0.2.2 安全修复（纯逻辑 / 假对象，不碰屏幕、不碰真 CAD）
+    test_ai_eye_capture_guard,
+    test_invalid_capture_box_fails_selftest,
+    test_config_env_key_not_persisted,
+    test_nx_journal_dir_same_source,
+    test_sw_com_disconnect_reconnect,
+    test_sw_feature_traversal_error_disconnects,
+    test_integration_scripts_only_close_owned,
     # v4：纯文件/纯逻辑，不开钩子不截图
     test_v4_session_naming,
     test_v4_crash_recovery,
@@ -1252,11 +2510,22 @@ if __name__ == "__main__":
     test_creo_nx_parsers()
     test_ai_eye_unit()
     test_capture_dpi_box()
+    test_invalid_capture_box_fails_selftest()
     test_reconcile()
     test_reconcile_stream1_guard()
     test_nx_journal_bridge()
+    test_nx_record_hint()
     test_gesture_and_ai_eye()
     test_cad_discovery()
+    # v0.2.2 安全修复（阻断：AI 眼越界；高危：装聋/密钥/NX 目录/写库/SW 重连/联调清理）
+    test_ai_eye_capture_guard()
+    test_config_env_key_not_persisted()
+    test_nx_journal_dir_same_source()
+    test_nx_bridge_data_dir_wired()
+    test_write_failure_keeps_session()
+    test_sw_com_disconnect_reconnect()
+    test_sw_feature_traversal_error_disconnects()
+    test_integration_scripts_only_close_owned()
     # v4 会话存储（v0.2.0）用例
     test_v4_session_naming()
     test_v4_session_folder_and_json()

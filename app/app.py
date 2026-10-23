@@ -21,7 +21,8 @@ from pathlib import Path
 from tkinter import messagebox, ttk
 
 from collector_core import (APP_VERSION, SingleInstanceLock, migrate_legacy_data,
-                            recover_sessions, resolve_data_dir, session_meta_path)
+                            nx_journal_dir, recover_sessions, resolve_data_dir,
+                            session_meta_path)
 from input_listener import CollectorSession, foreground_window_info, is_modeling_window
 
 REFRESH_MS = 500  # 界面数字每 0.5 秒刷新一次
@@ -48,9 +49,12 @@ class SettingsDialog(tk.Toplevel):
         self.cfg_mgr = ConfigManager(data_dir)
         self.cfg = self.cfg_mgr.load()
         self.cfg_path = self.cfg_mgr.path
+        # AI_EYE_KEY 环境变量只用于运行时：设置界面不把环境密钥当"用户配置"展示，
+        # 保存时也不把它写进 config.json（见 ConfigManager.save）。
+        self.env_key_active = bool(getattr(self.cfg_mgr, "env_key_active", False))
 
         self.title("设置")
-        self.geometry("480x430")
+        self.geometry("480x470")
         self.resizable(False, False)
         self.transient(master)
         self.grab_set()
@@ -76,11 +80,21 @@ class SettingsDialog(tk.Toplevel):
         key_row = tk.Frame(body)
         key_row.grid(row=3, column=1, sticky="w", pady=(6, 0))
         self.v_key = tk.Entry(key_row, width=32, show="●")
-        self.v_key.insert(0, ai.get("api_key", ""))
+        if self.env_key_active:
+            # 密钥来自环境变量：输入框留空并禁用（不把环境密钥显示成用户配置）
+            self.v_key.config(state="disabled")
+        else:
+            self.v_key.insert(0, ai.get("api_key", "") or "")
         self.v_key.pack(side="left")
         self.v_show = tk.BooleanVar(value=False)
         ttk.Checkbutton(key_row, text="显示", variable=self.v_show,
                         command=self._toggle_key).pack(side="left", padx=(6, 0))
+        if self.env_key_active:
+            ttk.Label(body,
+                      text="当前使用环境变量 AI_EYE_KEY（只用于运行时，不会写入 config.json；"
+                           "想在这里填 key，请先取消该环境变量后重开设置）",
+                      foreground="#b06a00", wraplength=430).grid(
+                row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
         ttk.Label(body, text="接口地址（留空=用服务商预设）").grid(row=4, column=0, sticky="w", pady=(6, 0))
         self.v_base = tk.Entry(body, width=32)
         self.v_base.insert(0, ai.get("api_base", ""))
@@ -135,14 +149,18 @@ class SettingsDialog(tk.Toplevel):
         ai = self.cfg.setdefault("ai_eye", {})
         ai["enabled"] = self.v_enabled.get()
         ai["provider"] = self.PROVIDER_KEYS.get(self.v_provider.get(), "mock")
-        ai["api_key"] = self.v_key.get().strip()
+        if self.env_key_active:
+            # 环境变量密钥只用于运行时：保存时保留文件里原来的 api_key（或空白），
+            # 绝不把环境密钥写进 config.json。
+            ai["api_key"] = self.cfg_mgr.file_api_key
+        else:
+            ai["api_key"] = self.v_key.get().strip()
         ai["api_base"] = self.v_base.get().strip()
         ai["model"] = self.v_model.get().strip()
         ai["save_images"] = self.v_saveimg.get()
         try:
-            self.cfg_path.parent.mkdir(parents=True, exist_ok=True)
-            self.cfg_path.write_text(
-                json.dumps(self.cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 统一走 ConfigManager.save（它还会再兜底一次"环境密钥不落盘"）
+            self.cfg_mgr.save(self.cfg)
         except Exception as exc:
             messagebox.showerror("设置", f"保存失败：{exc}")
             return
@@ -176,7 +194,7 @@ class App:
         self._fw = (None, None)
 
         root.title(f"CAD-AI 采集器 v{APP_VERSION}")
-        root.geometry("480x315")
+        root.geometry("480x420")
         root.resizable(False, False)
 
         # 状态灯
@@ -204,6 +222,16 @@ class App:
                                       wraplength=440, justify="center")
         self.s1_hint_label.pack(pady=(2, 0))
 
+        # NX 手动录制提醒（NX 切到前台、还没找到录制日志时才会出现；没有就空着）
+        # 为什么只能提醒：NX 的录制 API 只能在 NX 进程内调用，外部程序没法让
+        # 正在运行的 NX 开始录制（详见 input_listener.nx_record_hint 的说明）。
+        self.nx_hint_var = tk.StringVar(value="")
+        self.nx_hint_label = tk.Label(root, textvariable=self.nx_hint_var,
+                                      font=("Microsoft YaHei", 9, "bold"),
+                                      fg="#c0392b", wraplength=440,
+                                      justify="center")
+        self.nx_hint_label.pack(pady=(2, 0))
+
         # AI 眼状态行
         self.s3_var = tk.StringVar(value="AI 眼：未启用（设置里填 api_key 可开）")
         tk.Label(root, textvariable=self.s3_var, font=("Microsoft YaHei", 10),
@@ -227,6 +255,13 @@ class App:
                                   bg="#c0392b", fg="white",
                                   font=("Microsoft YaHei", 12))
         self.stop_btn.pack(side="left", padx=8)
+
+        # NX 录制日志目录：一键创建并打开（NX 只能在 NX 里手动点 Record Journal）
+        nx_row = tk.Frame(root)
+        nx_row.pack(pady=(8, 0))
+        tk.Button(nx_row, text="打开 NX 日志目录",
+                  command=self.on_open_nx_journal_dir,
+                  font=("Microsoft YaHei", 9)).pack()
 
         # 底部：数据位置 + 按钮
         loc_row = tk.Frame(root)
@@ -321,6 +356,11 @@ class App:
         if ai.get("pending") or ai.get("in_flight"):
             ai_line = (f"\nAI 眼收尾：等了 {ai.get('drained_s', 0)} 秒，"
                        f"还有 {ai.get('pending', 0)} 张没识别完（结果不写入本次会话）")
+        # 写库失败：会话保留、session.json status=error，界面必须明说（不能装成正常结束）
+        err_line = ""
+        if summary.get("status") == "error" or summary.get("error"):
+            err_line = (f"\n⚠ 本次会话有写库失败（session.json 已标 status=error，"
+                        f"数据已保留，未当空会话删除）：\n{summary.get('error')}")
         if summary.get("kept"):
             session_dir = Path(summary["session_dir"])
             self.last_session_dir = session_dir
@@ -329,14 +369,17 @@ class App:
         else:
             path_line = "本次没有记录到任何事件 → 未生成会话文件夹（空会话不留痕）。"
             self.loc_var.set("上次会话：空（没有记录到任何事件）")
-        messagebox.showinfo(
-            "本次小结",
+        report = (
             f"流1（软件事件）{c.get('stream1', 0)} 条\n"
             f"流2（输入操作）{c.get('stream2', 0)} 条\n"
             f"离开/回来边界 {stats.get('leave_count', 0)} 次\n"
-            f"时长 {summary.get('duration_s', 0)} 秒{ai_line}\n\n"
-            f"{path_line}",
+            f"时长 {summary.get('duration_s', 0)} 秒{ai_line}{err_line}\n\n"
+            f"{path_line}"
         )
+        if err_line:
+            messagebox.showwarning("本次小结（有错误）", report)
+        else:
+            messagebox.showinfo("本次小结", report)
 
     def on_open_dir(self):
         """打开最近一次会话文件夹；还没采过就打开数据根目录。"""
@@ -345,6 +388,30 @@ class App:
             target = Path(self.last_session_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         os.startfile(str(target))
+
+    def on_open_nx_journal_dir(self):
+        r"""打开 NX 录制日志目录 `<data_dir>\journals`（没有就先创建）。
+
+        NX 的录制只能由用户在 NX 内手动开始（录制 API 只能在 NX 进程内调用，
+        外部程序没法让正在运行的 NX 开始录制；run_journal 是批处理会退出；
+        startup 目录只认菜单文件）。所以这里只做"一键定位"：把日志目录建好并
+        打开，方便用户把 File → Utilities → Record Journal 的输出存进来。
+        打开失败（没有关联程序/权限问题）就静默提示，不让界面崩。
+        """
+        target = nx_journal_dir(self.data_dir)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(target))
+        except Exception:
+            try:
+                messagebox.showwarning(
+                    "打开失败",
+                    "没能打开 NX 日志目录：\n"
+                    f"{target}\n\n"
+                    "可以自己打开这个文件夹（已尝试创建）。",
+                )
+            except Exception:
+                pass
 
     def on_open_config(self):
         """打开设置窗口（图形界面）。"""
@@ -401,6 +468,9 @@ class App:
             else:
                 self.s1_var.set("流1：未启用")
                 self.s1_hint_var.set("")
+            # NX 手动录制提醒：NX 已在前台、但还没找到录制日志 → 醒目提醒；
+            # 其余情况（没开 nx 后端 / 已连上 / 设置里关掉 / 前台不是 NX）为空。
+            self.nx_hint_var.set((s.get("nx_hint") or {}).get("text") or "")
             # 流2 状态（装聋指示）
             title, exe = self._fw
             if is_modeling_window((title, exe), self.session.cfg.get("modeling_apps", [])):
@@ -418,6 +488,9 @@ class App:
                 )
             else:
                 self.s3_var.set("AI 眼：未启用（设置里填 api_key 可开）")
+        else:
+            # 没在采集：上次会话的 NX 提醒不该留在界面上
+            self.nx_hint_var.set("")
         self.root.after(REFRESH_MS, self._tick)
 
 

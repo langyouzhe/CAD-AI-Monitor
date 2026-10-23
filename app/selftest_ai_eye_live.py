@@ -3,8 +3,9 @@
 selftest_ai_eye_live.py —— AI 眼真实云端首测（用你自己配置的 key）
 
 流程与正式运行完全一致：
-  截图（所有显示器→按前台窗口裁剪）→ 送云端多模态 → 解析 JSON → 落库格式校验。
+  绑定前台窗口身份 → 截图（只截该窗口区域）→ 送云端多模态 → 解析 JSON → 落库格式校验。
 会真实调用一次云端（花费约几分钱），结果打印出来供人工判断。
+注意：触发前请把目标 CAD 窗口切到前台；前台不是建模窗口时会被安全跳过（不截图、不上传）。
 
 用法：python selftest_ai_eye_live.py [data_dir]
 """
@@ -19,16 +20,19 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from ai_eye import AiEye  # noqa: E402
+from input_listener import foreground_window_identity  # noqa: E402
 
 
 def main():
-    from collector_core import resolve_data_dir
+    from collector_core import ConfigManager, resolve_data_dir
     data_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else resolve_data_dir()
     cfg_path = data_dir / "config.json"
     if not cfg_path.exists():
-        print(f"找不到配置: {cfg_path}")
+        print(f"找不到配置: {cfg_path}（先运行一次主程序生成配置）")
         return 1
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8")).get("ai_eye", {})
+    # 用 ConfigManager 合并默认值（含 modeling_apps）与运行时环境密钥
+    merged = ConfigManager(data_dir).load()
+    cfg = merged.get("ai_eye", {})
     print(f"服务商={cfg.get('provider')} | 模型={cfg.get('model')} | "
           f"接口={cfg.get('api_base')} | max_tokens={cfg.get('max_tokens')}")
     if cfg.get("provider") == "mock":
@@ -38,12 +42,23 @@ def main():
     results = []
     eye = AiEye(cfg=cfg, on_result=lambda d, ts: results.append((d, ts)),
                 is_running=lambda: True,
-                images_dir=Path(tempfile.mkdtemp(prefix="cad-ai-eye-live-")) / "images")
+                images_dir=Path(tempfile.mkdtemp(prefix="cad-ai-eye-live-")) / "images",
+                modeling_apps=merged.get("modeling_apps"),
+                allow_all_windows=bool((merged.get("debug") or {}).get("allow_all_windows")))
     eye.start()
     ts = int(time.time() * 1000)
+    # 触发时必须带上"当前前台窗口身份"——AI 眼只截这个窗口，且截图前会复核；
+    # 前台不是建模窗口时会被安全跳过（不截图/不上传），这里先提示用户切到 CAD。
+    hwnd, title, exe = foreground_window_identity()
+    win = {"hwnd": hwnd, "title": title, "exe": exe, "ts": ts}
     print("触发一次截图识别（目标：当前前台窗口）…")
+    print(f"前台窗口：hwnd={hwnd} exe={exe} title={title}")
+    if not hwnd:
+        print("拿不到前台窗口身份（请确认程序有权限枚举窗口）——本轮跳过")
+        eye.stop()
+        return 1
     t0 = time.time()
-    eye.trigger("click", {"button": "left"}, ts, (400, 400))
+    eye.trigger("click", {"button": "left"}, ts, (400, 400), window=win)
     deadline = time.time() + 120
     while time.time() < deadline and not results:
         time.sleep(0.2)
