@@ -33,7 +33,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from collector_core import (  # noqa: E402
-    DEFAULT_CONFIG, ConfigManager, EventStore, SingleInstanceLock,
+    APP_VERSION, DEFAULT_CONFIG, ConfigManager, EventStore, SingleInstanceLock,
     create_session_dir, iter_all_events, iter_session_databases,
     migrate_legacy_data, read_session_json, recover_sessions,
     session_db_path, session_meta_path, session_summaries, sessions_root,
@@ -845,7 +845,7 @@ def test_v4_session_folder_and_json():
         assert meta, "会话里必须有 session.json"
         for key in expected_keys:
             assert key in meta, (key, meta)
-        assert meta["app_version"] == "0.2.0", meta["app_version"]
+        assert meta["app_version"] == APP_VERSION, meta["app_version"]
         assert meta["schema_version"] == 2
         assert meta["storage_version"] == 4
         assert meta["status"] == "completed"

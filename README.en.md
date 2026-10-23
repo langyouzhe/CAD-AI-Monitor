@@ -8,9 +8,9 @@
 
 A local-first collector that records *how* you actually model in SolidWorks / Creo / NX: software events, your real mouse & keyboard actions, and optional AI vision on top. Built so an AI can later learn **your personal modeling style**. All data stays on your own machine.
 
-> ⚖️ **Trademark notice** — This is an independent personal project. It is **not affiliated with, authorized, sponsored or endorsed by** Dassault Systèmes, PTC, Siemens or their affiliates. SolidWorks®, Creo® and NX™ are trademarks of their respective owners and are named here **only to describe compatibility**. The tool reads data that these applications themselves produce or expose locally (COM interface, Creo trail files, NX syslog). It does not modify, crack or bypass any software licensing.
+> ⚖️ **Trademark notice** — This is an independent personal project. It is **not affiliated with, authorized, sponsored or endorsed by** Dassault Systèmes, PTC, Siemens or their affiliates. SolidWorks®, Creo® and NX™ are trademarks of their respective owners and are named here **only to describe compatibility**. The tool reads data that these applications themselves produce or expose locally (COM interface, Creo trail files, NX recorded journals). It does not modify, crack or bypass any software licensing.
 
-> 🏷️ **Versioning** — Public releases follow semantic versioning; the current release is **v0.2.0** (`0.x` = early, interfaces may still change). Labels such as *v2* / *v3* / *v4* that appear in code comments or the Chinese documentation are **internal development generations** (2nd architecture → 3rd adds vision → 4th adds per-session storage), not release versions.
+> 🏷️ **Versioning** — Public releases follow semantic versioning; the current release is **v0.2.1** (`0.x` = early, interfaces may still change). Labels such as *v2* / *v3* / *v4* that appear in code comments or the Chinese documentation are **internal development generations** (2nd architecture → 3rd adds vision → 4th adds per-session storage), not release versions.
 
 > 🔒 **Privacy** — This program is technically a keyboard/mouse recorder, so please read [PRIVACY.md](PRIVACY.md) before using it. Short version: it only records while a CAD window is in front, everything is stored locally, and the only network activity is the optional AI Eye that you enable with your own API key.
 

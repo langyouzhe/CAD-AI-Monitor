@@ -6,6 +6,37 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/) —
 `0.x` means "early, interfaces may still change".
 
+## [0.2.1] - 2026-10-23
+
+NX stream 1 now reads the **recorded journal** instead of syslog; reconciliation no
+longer reports false anomalies when stream 1 has no data source; AI Eye uses a working
+multimodal provider by default.
+
+### Fixed
+
+- **NX stream 1 data source.** `app/journal_parser.py` parses NX Record Journal output
+  (`.cs` / `.py` / `.vb`): `// Menu: ...` comments and NXOpen calls, with UTF-16 / UTF-8
+  auto-detection and a content check so plain scripts are not mistaken for journals.
+  `app/nx_bridge.py` tails `nx.journal_path` (explicit) or the newest content-matching
+  journal in Desktop / Documents / Downloads / `data\journals`. Legacy syslog is no longer
+  read (it contained only startup/crash diagnostics).
+- **Reconciliation false positives.** When no stream-1 backend is connected, reconciliation
+  is skipped and a single `meta/stream1_unavailable` marker is written instead of one
+  false `stream2_no_effect` per action.
+- **AI Eye provider / model.** Docs and example config now point at multimodal providers
+  (Zhipu `glm-4v-flash`, Qwen `qwen-vl-plus`). `deepseek-flash` is not a valid public model
+  name and DeepSeek's public API does not accept images. `AI_EYE_KEY` environment variable
+  overrides the key in `config.json`.
+- **NX executable discovery.** `selftest_nx.py` no longer hardcodes a path; it calls
+  `cad_discovery.nx_exe_path()` (registry + common install roots).
+- **Empty-session rule.** Only stream 1 / stream 2 events count as content, so meta
+  markers (including the new `stream1_unavailable`) no longer keep an empty session folder.
+
+### Tests
+
+- `python app\selftest.py` — 25 tests (journal parser, journal tailing, reconcile guard
+  added); `--ci` — 17 tests.
+
 ## [0.2.0] - 2026-10-19
 
 Session storage v4: every *start → stop* is now its own folder, so repeated collections
