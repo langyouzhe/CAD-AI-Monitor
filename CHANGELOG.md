@@ -6,6 +6,52 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versioning follows [Semantic Versioning](https://semver.org/) —
 `0.x` means "early, interfaces may still change".
 
+## [0.2.3] - 2026-10-27
+
+NX 2406 field-test preparation: replay operations that were journaled **before** collection
+started, parse the Python/VB comment flavours, make the journal file pickable from the UI, and
+add an **experimental** "record automatically at NX startup" script generator (whether NX
+executes it is not verified yet).
+
+### Added
+
+- **`nx.replay_existing` (default `false`).** When `true`, `NxBridge` replays every line that
+  was already in the journal when it attaches (or re-attaches after the file is truncated),
+  emitting the same `nx_journal` menu/API events in line order, then keeps tailing only new
+  lines. The replay happens **once per attach**, not on every poll. The default stays `false`
+  (old behaviour); reusing one journal file across sessions can duplicate the previous
+  session's operations during replay (documented in both READMEs).
+- **Choose NX journal file** button in the main window: opens a file dialog for
+  `.cs`/`.py`/`.vb`, writes `nx.journal_path` into `config.json` (other keys preserved,
+  `AI_EYE_KEY` never persisted) and tells the user it takes effect on the next Start. While an
+  NX journal is attached, the status area also shows `已接入：<journal path>`.
+- **Generate NX auto-record script (experimental)** button: writes
+  `<data_dir>\nx\autorecord_startup.py` (`import NXOpen` +
+  `Session.GetSession().JournalManager.RecordJournal(...)` targeting
+  `<data_dir>\journals\nx_<timestamp>.cs`, wrapped in `try/except`) and explains that the file
+  must be copied to `%UGII_USER_DIR%\startup\` and NX restarted. Whether NX executes startup
+  `*.py` files is **unverified**, so the button, dialog and docs label it experimental.
+- New `tests/fixtures/journal_sample.py` (UTF-8 Python journal) and self-tests covering journal
+  replay (replay on / off / append-only-new / truncate-reattach), the generated auto-record
+  script, and journal-path saving.
+
+### Changed
+
+- `journal_parser.MENU_RE` now accepts `//`, `#` and `'` comment prefixes with optional
+  leading whitespace (`.cs` / `.py` / `.vb` journals) while still matching only `Menu:` lines;
+  `API_RE` is unchanged. Previously only `// Menu:` was recognised, so NX's Python/VB journals
+  produced no menu events.
+- `config.example.json` documents `nx.replay_existing`.
+- README / README.en NX sections document replay (and its cross-session duplication risk), the
+  file-picker button and the unverified experimental startup script.
+
+### Tests
+
+- `python app\selftest.py` — 40 test functions, all green (42 OK lines).
+- `python app\selftest.py --ci` — 29 test functions, all green (31 OK lines).
+- New deterministic coverage: replay on/off/append-only/truncate-reattach, auto-record script
+  generation, journal-path saving, Python/VB menu parsing.
+
 ## [0.2.2] - 2026-10-24
 
 Portability cleanup (no machine-specific paths/versions in shipped code) plus the security and

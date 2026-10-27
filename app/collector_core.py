@@ -41,7 +41,7 @@ import cad_discovery
 # 等觉得"别人可以放心用了"再发 1.0.0。
 # 注意：文档/注释里出现的 v2、v3、v4 是**开发内部迭代编号**（第 2 代架构、第 3 代加视觉、
 # 第 4 代会话存储），不是发布版本号——两者不要混。
-APP_VERSION = "0.2.2"
+APP_VERSION = "0.2.3"
 
 # events.db 的表结构版本（表结构不变时这个数字不动）
 SCHEMA_VERSION = 2
@@ -104,6 +104,12 @@ DEFAULT_CONFIG = {
         "journal_path": "",                # ← 指定 journal 文件（最稳）；留空=自动找
         "journal_dirs": [],                # 留空 = 默认 桌面/文档/下载/data\journals
         "poll_interval_s": 1.0,
+        # v0.2.3：挂上 journal 时是否把**已有的全部行**补读一遍。
+        # false（默认）= 旧行为：只收"点开始采集之后"追加的新行；
+        # true = 把点开始采集之前就已经录进 journal 的操作也回调出来。
+        # 注意：只在"挂上/文件被截断重挂"时补读一次，不是每轮轮询都补；
+        # 跨会话重复录制到同一个 journal 时，旧操作会被再补读一次（见 README）。
+        "replay_existing": False,
         # NX 切到前台、却还没找到录制日志时，界面上提醒"记得点 Record Journal"。
         # （为什么只能提醒、不能自动开录制：见 input_listener.nx_record_hint 的说明）
         "hint_when_not_recording": True,   # 嫌吵可以改 false
@@ -208,6 +214,76 @@ def nx_journal_dir(data_dir=None) -> Path:
     """
     root = Path(data_dir) if data_dir is not None else resolve_data_dir()
     return root / "journals"
+
+
+# ---------- NX 实验功能：启动自动录制脚本（v0.2.3） ----------
+#
+# 背景：NX 的录制只能在 NX 进程内开始，外部程序没法让正在运行的 NX 开始录。
+# 网上常见做法是把一段 Python 放进 NX 的 startup 目录，让 NX 启动时自己调
+# JournalManager.RecordJournal。**这个行为尚未在真机验证**，所以这里只负责
+# 生成脚本给用户自己复制过去试（不自动改 NX 的 startup 目录、不启动 NX），
+# 界面按钮上明确标注"实验"。
+
+NX_AUTORECORD_DIRNAME = "nx"                    # <data_dir>\nx\
+NX_AUTORECORD_SCRIPT = "autorecord_startup.py"  # 生成出来的脚本名
+NX_AUTORECORD_TIME_FORMAT = "%Y%m%d_%H%M%S"     # 录到 journals\nx_<时间戳>.cs
+
+
+def nx_autorecord_dir(data_dir=None) -> Path:
+    r"""实验性自动录制脚本的存放目录：`<数据根>\nx`。"""
+    root = Path(data_dir) if data_dir is not None else resolve_data_dir()
+    return root / NX_AUTORECORD_DIRNAME
+
+
+def nx_autorecord_script_path(data_dir=None) -> Path:
+    r"""生成脚本的完整路径：`<数据根>\nx\autorecord_startup.py`。"""
+    return nx_autorecord_dir(data_dir) / NX_AUTORECORD_SCRIPT
+
+
+def nx_autorecord_script_text(data_dir=None, when=None) -> str:
+    r"""自动录制脚本的内容（纯函数，便于单测）。
+
+    目标录制文件：`<数据根>\journals\nx_<yyyyMMdd_HHMMSS>.cs`
+    （和界面【打开 NX 日志目录】、桥默认目录同源，见 nx_journal_dir）。
+
+    脚本用 try/except 包住：即使 NX 的 startup 机制真的执行它、而 API 变了，
+    也不至于让 NX 启动报错。
+    """
+    root = Path(data_dir) if data_dir is not None else resolve_data_dir()
+    stamp = (when or datetime.now()).strftime(NX_AUTORECORD_TIME_FORMAT)
+    journal = nx_journal_dir(root) / f"nx_{stamp}.cs"
+    # 用 raw string 字面量：Windows 路径里的反斜杠不用转义，文件内容里就是原样
+    # 路径（用户看得懂；路径不以反斜杠结尾，raw string 合法）。
+    journal_literal = 'r"' + str(journal) + '"'
+    return (
+        "# -*- coding: utf-8 -*-\n"
+        f"# CAD-AI-Monitor v{APP_VERSION} 实验功能：NX 启动时自动开始录制 journal。\n"
+        "# 用法：把本文件复制到 %UGII_USER_DIR%\\startup\\ 后重启 NX。\n"
+        "# 注意：NX 是否会在启动时执行 startup\\ 下的 .py 尚未验证，属实验功能；\n"
+        "#       如果没有生效，请在 NX 里手动 File -> Utilities -> Record Journal。\n"
+        "# 本脚本不改任何 NX 设置，只调用 NXOpen 的录制接口。\n"
+        "import os\n"
+        "import NXOpen\n"
+        "\n"
+        f"_JOURNAL = {journal_literal}\n"
+        "\n"
+        "try:\n"
+        "    os.makedirs(os.path.dirname(_JOURNAL), exist_ok=True)\n"
+        "    NXOpen.Session.GetSession().JournalManager.RecordJournal(_JOURNAL)\n"
+        "except Exception as exc:  # 实验功能：失败也不让 NX 启动报错\n"
+        "    try:\n"
+        '        print("[CAD-AI-Monitor] NX 自动录制没有起来: %s" % exc)\n'
+        "    except Exception:\n"
+        "        pass\n"
+    )
+
+
+def write_nx_autorecord_script(data_dir=None, when=None) -> Path:
+    r"""生成实验性自动录制脚本并写盘，返回脚本路径。"""
+    path = nx_autorecord_script_path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(nx_autorecord_script_text(data_dir, when=when), encoding="utf-8")
+    return path
 
 
 # ======================================================================
@@ -877,6 +953,23 @@ class ConfigManager:
     @property
     def values(self) -> dict:
         return self._values or self.load()
+
+
+def set_nx_journal_path(data_dir, journal_path) -> dict:
+    r"""把用户选的 NX journal 文件写进 config.json 的 `nx.journal_path`。
+
+    为什么单独抽一个函数（v0.2.3）：界面上的【选择 NX journal 文件】按钮要
+    "只改这一个键、保留其它设置、环境变量 AI_EYE_KEY 不落盘"。走 ConfigManager
+    的 load/save 就能同时满足这三点（save 会把环境密钥还原成文件里原来的值），
+    抽出来以后单测可以不依赖 tkinter（CI 也能跑）。
+
+    返回写入后的完整配置 dict；写盘失败抛异常，由界面提示。
+    """
+    mgr = ConfigManager(Path(data_dir))
+    cfg = mgr.load()
+    cfg.setdefault("nx", {})["journal_path"] = str(journal_path or "")
+    mgr.save(cfg)
+    return cfg
 
 
 # ======================================================================

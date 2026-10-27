@@ -8,7 +8,13 @@ v2 新增（按最新版项目上下文）：
 - 不再显示停顿计数，改为 流1/流2 各自条数 + 离开次数；
 - 新增【打开设置】按钮：改 data\\config.json 里的建模窗口名单、离开阈值等。
 
-数据只保存在本地（exe 旁的 data 目录，或 文档\CAD-AI-Monitor\data），不会联网。
+v0.2.3 新增（NX 2406 实测准备）：
+- 【选择 NX journal 文件】：把选中的 .cs/.py/.vb 写进 nx.journal_path（下次开始采集生效）；
+- 状态区显示"已接入：<journal 文件>"；
+- 【生成 NX 自动录制脚本（实验）】：生成 <data_dir>\\nx\\autorecord_startup.py，
+  说明"复制到 %UGII_USER_DIR%\\startup\\ 后重启 NX 试试"（NX 是否执行尚未验证）。
+
+数据只保存在本地（exe 旁的 data 目录，或 文档\\CAD-AI-Monitor\\data），不会联网。
 """
 import json
 import os
@@ -18,11 +24,12 @@ import tempfile
 import time
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from collector_core import (APP_VERSION, SingleInstanceLock, migrate_legacy_data,
                             nx_journal_dir, recover_sessions, resolve_data_dir,
-                            session_meta_path)
+                            session_meta_path, set_nx_journal_path,
+                            write_nx_autorecord_script)
 from input_listener import CollectorSession, foreground_window_info, is_modeling_window
 
 REFRESH_MS = 500  # 界面数字每 0.5 秒刷新一次
@@ -194,7 +201,7 @@ class App:
         self._fw = (None, None)
 
         root.title(f"CAD-AI 采集器 v{APP_VERSION}")
-        root.geometry("480x420")
+        root.geometry("480x500")
         root.resizable(False, False)
 
         # 状态灯
@@ -232,6 +239,13 @@ class App:
                                       justify="center")
         self.nx_hint_label.pack(pady=(2, 0))
 
+        # NX 已接入的 journal 文件（有 NX 后端连上时才显示；排错时一眼看到读的是哪个文件）
+        self.nx_attach_var = tk.StringVar(value="")
+        self.nx_attach_label = tk.Label(root, textvariable=self.nx_attach_var,
+                                        font=("Microsoft YaHei", 9), fg="#2e6da4",
+                                        wraplength=450, justify="center")
+        self.nx_attach_label.pack(pady=(2, 0))
+
         # AI 眼状态行
         self.s3_var = tk.StringVar(value="AI 眼：未启用（设置里填 api_key 可开）")
         tk.Label(root, textvariable=self.s3_var, font=("Microsoft YaHei", 10),
@@ -256,11 +270,21 @@ class App:
                                   font=("Microsoft YaHei", 12))
         self.stop_btn.pack(side="left", padx=8)
 
-        # NX 录制日志目录：一键创建并打开（NX 只能在 NX 里手动点 Record Journal）
+        # NX 录制日志目录 / 选择 journal 文件 / 实验性自动录制脚本
         nx_row = tk.Frame(root)
         nx_row.pack(pady=(8, 0))
         tk.Button(nx_row, text="打开 NX 日志目录",
                   command=self.on_open_nx_journal_dir,
+                  font=("Microsoft YaHei", 9)).pack(side="left", padx=(0, 6))
+        tk.Button(nx_row, text="选择 NX journal 文件",
+                  command=self.on_pick_nx_journal,
+                  font=("Microsoft YaHei", 9)).pack(side="left")
+
+        # 实验功能：生成"NX 启动时自动开始录制"的脚本（NX 是否会执行尚未验证）
+        nx_exp_row = tk.Frame(root)
+        nx_exp_row.pack(pady=(4, 0))
+        tk.Button(nx_exp_row, text="生成 NX 自动录制脚本（实验）",
+                  command=self.on_gen_nx_autorecord,
                   font=("Microsoft YaHei", 9)).pack()
 
         # 底部：数据位置 + 按钮
@@ -393,9 +417,9 @@ class App:
         r"""打开 NX 录制日志目录 `<data_dir>\journals`（没有就先创建）。
 
         NX 的录制只能由用户在 NX 内手动开始（录制 API 只能在 NX 进程内调用，
-        外部程序没法让正在运行的 NX 开始录制；run_journal 是批处理会退出；
-        startup 目录只认菜单文件）。所以这里只做"一键定位"：把日志目录建好并
-        打开，方便用户把 File → Utilities → Record Journal 的输出存进来。
+        外部程序没法让正在运行的 NX 开始录制；run_journal 是批处理会退出）。
+        所以这里只做"一键定位"：把日志目录建好并打开，方便用户把
+        File → Utilities → Record Journal 的输出存进来。
         打开失败（没有关联程序/权限问题）就静默提示，不让界面崩。
         """
         target = nx_journal_dir(self.data_dir)
@@ -412,6 +436,72 @@ class App:
                 )
             except Exception:
                 pass
+
+    def on_pick_nx_journal(self):
+        r"""选择 NX journal 文件 → 写 config.json 的 `nx.journal_path`（下次开始采集生效）。
+
+        为什么要有这个按钮：公司机排错时，"journal 到底存哪、选哪一份"最容易迷路。
+        选完只改这一个键（保留其它设置；环境变量 AI_EYE_KEY 不落盘），
+        下次点【开始采集】时新配置才生效（当前会话不受影响）。
+        """
+        target = nx_journal_dir(self.data_dir)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        try:
+            path = filedialog.askopenfilename(
+                parent=self.root,
+                title="选择 NX journal 文件（.cs / .py / .vb）",
+                initialdir=str(target) if target.is_dir() else None,
+                filetypes=[
+                    ("NX 录制日志", "*.cs *.py *.vb"),
+                    ("C# journal", "*.cs"),
+                    ("Python journal", "*.py"),
+                    ("VB journal", "*.vb"),
+                    ("所有文件", "*.*"),
+                ],
+            )
+        except Exception as exc:      # 极端环境没有文件对话框：别让界面崩
+            messagebox.showerror("选择 NX journal", f"打开文件对话框失败：\n{exc}")
+            return
+        if not path:
+            return                    # 用户取消
+        try:
+            set_nx_journal_path(self.data_dir, path)
+        except Exception as exc:
+            messagebox.showerror("保存失败", "没能把 journal 路径写进配置：\n\n" + str(exc))
+            return
+        messagebox.showinfo(
+            "NX journal 已保存",
+            "已保存，下次开始采集生效。\n\n"
+            f"journal 文件：\n{path}",
+        )
+
+    def on_gen_nx_autorecord(self):
+        r"""生成实验性"NX 启动自动录制"脚本（不验证、不自动装进 NX）。
+
+        脚本内容：import NXOpen，调 JournalManager.RecordJournal 录到
+        `<data_dir>\journals\nx_<时间戳>.cs`，用 try/except 包住。
+        是否真的生效取决于 NX 是否执行 `%UGII_USER_DIR%\startup\` 下的 .py，
+        这一点**尚未在真机验证**，所以按钮和弹窗都明确标"实验"。
+        """
+        try:
+            path = write_nx_autorecord_script(self.data_dir)
+        except Exception as exc:
+            messagebox.showerror(
+                "生成失败",
+                "没能生成 NX 自动录制脚本：\n\n" + str(exc),
+            )
+            return
+        messagebox.showinfo(
+            "实验功能：NX 自动录制脚本（未验证）",
+            "已生成脚本：\n"
+            f"{path}\n\n"
+            "把此文件复制到 %UGII_USER_DIR%\\startup\\ 后重启 NX 试试。\n\n"
+            "NX 是否执行 startup 脚本尚未验证，属实验功能；\n"
+            "如果没生效，请在 NX 里手动 File → Utilities → Record Journal。",
+        )
 
     def on_open_config(self):
         """打开设置窗口（图形界面）。"""
@@ -447,6 +537,7 @@ class App:
             )
             # 流1 状态（多后端）
             st1 = s.get("stream1_status")
+            nx_attached = None
             if st1:
                 parts = []
                 hints = []
@@ -457,6 +548,10 @@ class App:
                         parts.append(f"{name}✓ {doc or ''}")
                     else:
                         parts.append(f"{name}✗")
+                    # NX 已接入的具体 journal 文件（公司机排错时一眼看到读的是哪份）
+                    if (str(name).lower() == "nx" and b.get("connected")
+                            and b.get("journal_file")):
+                        nx_attached = str(b["journal_file"])
                     err = b.get("last_error")
                     # "等软件打开"这种正常等待不刷提示；只有"连上了却没数据"或
                     # 真出错（如 trail 文件不更新）才提醒
@@ -468,6 +563,7 @@ class App:
             else:
                 self.s1_var.set("流1：未启用")
                 self.s1_hint_var.set("")
+            self.nx_attach_var.set(f"已接入：{nx_attached}" if nx_attached else "")
             # NX 手动录制提醒：NX 已在前台、但还没找到录制日志 → 醒目提醒；
             # 其余情况（没开 nx 后端 / 已连上 / 设置里关掉 / 前台不是 NX）为空。
             self.nx_hint_var.set((s.get("nx_hint") or {}).get("text") or "")
@@ -489,8 +585,9 @@ class App:
             else:
                 self.s3_var.set("AI 眼：未启用（设置里填 api_key 可开）")
         else:
-            # 没在采集：上次会话的 NX 提醒不该留在界面上
+            # 没在采集：上次会话的 NX 提醒/接入信息不该留在界面上
             self.nx_hint_var.set("")
+            self.nx_attach_var.set("")
         self.root.after(REFRESH_MS, self._tick)
 
 

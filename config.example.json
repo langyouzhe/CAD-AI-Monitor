@@ -78,6 +78,7 @@
     "enabled": true,
     "journal_path": "",
     "journal_dirs": [],
+    "replay_existing": false,
     "hint_when_not_recording": true,
     "poll_interval_s": 1.0
   },

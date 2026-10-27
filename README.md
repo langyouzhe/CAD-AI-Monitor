@@ -1,4 +1,4 @@
-# CAD-AI 采集器 v0.2.2 —— 使用说明（大白话版）
+# CAD-AI 采集器 v0.2.3 —— 使用说明（大白话版）
 
 **中文** | [English](README.en.md)
 
@@ -28,7 +28,7 @@
 | **对账（meta）** | 停止采集时自动**三方对账**：动作↔流1效果↔视觉结论，缺票自动标异常 | `meta/anomaly`（stream2_no_effect / stream1_orphan / visual_missing / visual_failed） |
 | **meta** | 会话开始/停止、离开/回来 | 无操作超 N 分钟记 `leave`，回来补 `return` |
 
-> **版本号怎么看**：公开发布用**语义化版本**，当前是 **v0.2.2**（`0.x` 表示"早期版本、接口可能变"；等它稳定到别人可以放心用了，才发 `1.0.0`）。文档和代码注释里偶尔出现的 **v2 / v3 / v4** 是开发过程中的**内部迭代编号**（第 2 代架构 → 第 3 代加视觉 → 第 4 代会话存储），**不是发布版本号**，别混淆。
+> **版本号怎么看**：公开发布用**语义化版本**，当前是 **v0.2.3**（`0.x` 表示"早期版本、接口可能变"；等它稳定到别人可以放心用了，才发 `1.0.0`）。文档和代码注释里偶尔出现的 **v2 / v3 / v4** 是开发过程中的**内部迭代编号**（第 2 代架构 → 第 3 代加视觉 → 第 4 代会话存储），**不是发布版本号**，别混淆。
 
 **当前已实现**：笔势记录、SW 快捷键本地翻译、AI 眼（视觉）、Creo 桥、NX 桥（Journal）、三方对账、CAD 自动发现。
 
@@ -112,7 +112,13 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 
 > **NX 用户注意**：流1 读的是 NX 的「录制日志」文件（`.cs/.py`），不是 syslog。用法：在 NX 里 `File → Utilities → Record Journal`（或 `Tools → Journal → Record`）开始录制，保存到桌面/文档/`data\journals`；采集器会自动找最新一份，也可在设置里用 `nx.journal_path` 指定。syslog 是崩溃诊断日志，已不再使用。
 
-> **NX 手动录制提醒（只提醒，不做假自动化）**：NX 的录制接口只能在 NX 进程内调用（`run_journal.exe -nx` 是批处理，脚本跑完 NX 就退出；startup 目录只认菜单文件、不执行 Python），所以采集器**没法从外部让正在运行的 NX 开始录制**。它能做的是「提醒 + 一键定位」：当你把 NX 切到前台、而采集器还没找到录制日志时，界面会用红字提醒「请在 NX 里点 File → Utilities → Record Journal（或设置 `nx.journal_path`）」；录制日志默认放 `data\journals\`，界面上的【打开 NX 日志目录】按钮会**先创建再打开**这个文件夹。嫌提醒吵，可在 `config.json` 里把 `nx.hint_when_not_recording` 改成 `false`。
+> **先录了一段 journal、才点【开始采集】？** 默认只收"点开始采集之后"追加的新操作（旧行为）。想连开始采集之前已经录进 journal 的操作一起补回来，把 `config.json` 里的 `nx.replay_existing` 改成 `true`（或照着 `config.example.json` 补一行）。它只在"挂上 journal / 文件被截断后重挂"时从头补读**一次**，不是每轮轮询都补。⚠️ 注意：如果多段会话重复写进**同一个** journal 文件，补读会把上一段会话的旧操作也再读一遍（跨会话重复风险）；不想重复就保持默认 `false`，或每次录制都新建一个 journal 文件。
+
+> **不知道 journal 存哪 / 选哪一份？** 主窗口的【选择 NX journal 文件】按钮可以直接选 `.cs/.py/.vb`，写进 `nx.journal_path`（只改这个键、保留其它设置，环境变量密钥不会落盘），**下次点【开始采集】生效**；有 NX 接入时状态区还会显示"已接入：<journal 文件路径>"，一眼确认读的是哪份文件。
+
+> **实验功能：NX 启动自动录制（未验证）**：主窗口【生成 NX 自动录制脚本（实验）】会在 `<data_dir>\nx\autorecord_startup.py` 生成脚本（`import NXOpen` → `Session.GetSession().JournalManager.RecordJournal(...)`，录到 `<data_dir>\journals\nx_<时间戳>.cs`，try/except 包住）。把它**手动复制**到 `%UGII_USER_DIR%\startup\` 后重启 NX 试试。⚠️ NX 是否会在启动时执行 startup 目录下的 `.py` **尚未在真机验证**，这是实验功能、不保证生效；不生效时照常手动 Record Journal。
+
+> **NX 手动录制提醒（只提醒，不做假自动化）**：NX 的录制接口只能在 NX 进程内调用（`run_journal.exe -nx` 是批处理，脚本跑完 NX 就退出；常见的 startup 机制也只放菜单文件，v0.2.3 新增的实验脚本是否会被执行尚未验证），所以采集器**没法从外部让正在运行的 NX 开始录制**。它能做的是「提醒 + 一键定位 + 选文件」：当你把 NX 切到前台、而采集器还没找到录制日志时，界面会用红字提醒「请在 NX 里点 File → Utilities → Record Journal（或设置 `nx.journal_path`）」；录制日志默认放 `data\journals\`，界面上的【打开 NX 日志目录】按钮会**先创建再打开**这个文件夹。嫌提醒吵，可在 `config.json` 里把 `nx.hint_when_not_recording` 改成 `false`。
 
 自动发现具体找什么：
 
@@ -141,6 +147,7 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 | `ai_eye.rate_per_min` | `60` | 限流：每分钟最多截几张 |
 | `creo.trail_dirs` / `nx.journal_path` / `nx.journal_dirs` | 空=自动发现 | 手动指定 trail 或 NX 录制日志（`.cs/.py`）的文件/目录；最稳的是 `nx.journal_path` |
 | `nx.hint_when_not_recording` | `true` | NX 在前台、但还没找到录制日志时，界面显示提醒（`false` = 关掉） |
+| `nx.replay_existing` | `false` | 挂上 journal 时是否把**已录好的内容**补读一遍（补回"先录 journal、后点开始采集"的操作）；只在挂上/截断重挂时补一次，跨会话重复写同一文件时注意重复 |
 | `creo.stale_minutes` | `10` | trail 超过这么久没更新就提示"流1 可能收不到" |
 | `reconcile.window_ms` | `2000` | 对账窗口：动作之后多久内的流1 事件算它的"效果" |
 | `reconcile.ignore_middle` | `true` | 中键/滚轮不算动作（旋转视图本来没有流1 事件） |
@@ -182,7 +189,7 @@ data\legacy\migration.log        ← 迁移日志（成功/失败都记一笔）
 ## 已知限制（记在案）
 
 1. **AI 眼**：mock 模式与真实云端都验证过。**provider 默认值是 `mock`（假识别、不联网、不花钱）**，要真识别必须自己改成多模态服务商并填 key。**视觉模型必须是多模态**：zhipu `glm-4v-flash`、qwen `qwen-vl-plus` 等；DeepSeek 官方 API（`deepseek-chat`/`deepseek-reasoner`）是纯文本，不能看图，`deepseek-flash` 这个模型名也不存在（2026-10-23 问题清单）。推理型模型会先思考再回答，`max_tokens` 给小了回答会是空的——默认 4000，可在设置里调大。
-2. **NX 数据源（2026-10-23 换）**：syslog 是崩溃诊断日志，不含建模操作（4 次历史会话流1 全空）；现在读 NX「录制日志」的 `.cs/.py`，解析 `Menu:` 注释与 NXOpen 调用。**需要你先在 NX 里录制一次日志**（Journal），或配置 `nx.journal_path`。**"自动开录制"（点开始采集就自动录）不可行**：NX 的录制接口只能在 NX 进程内调用，外部程序无法让正在运行的 NX 开始录制；所以现在只做**提醒 + 一键定位**（NX 在前台却没找到 journal 时界面红字提醒，见上文），不做任何界面自动化/模拟点击。
+2. **NX 数据源（2026-10-23 换）**：syslog 是崩溃诊断日志，不含建模操作（4 次历史会话流1 全空）；现在读 NX「录制日志」的 `.cs/.py`，解析 `Menu:` 注释与 NXOpen 调用（v0.2.3 起 C#/Python/VB 三种注释前缀都认）。**需要你先在 NX 里录制一次日志**（Journal），或配置 `nx.journal_path`；先录了日志才点开始采集的，可把 `nx.replay_existing` 改成 `true` 补读（跨会话重复风险见上文）。**"自动开录制"（点开始采集就自动录）不可行**：NX 的录制接口只能在 NX 进程内调用，外部程序无法让正在运行的 NX 开始录制；所以现在只做**提醒 + 一键定位 + 选文件**（NX 在前台却没找到 journal 时界面红字提醒，见上文），不做任何界面自动化/模拟点击。v0.2.3 另有一个**实验性**的"启动自动录制脚本"生成器（需自己复制到 `%UGII_USER_DIR%\startup\`，NX 是否执行**尚未验证**）。
 3. **笔势命令名**：方向 100% 准确 + 原始命令 ID 已记。"ID→命令名"对照表**不在仓库里分发**（它来自 SolidWorks 自己的类型库，再分发有法律争议）：程序第一次运行时会**从你本机装的 SW 现场生成**一张表存到 `data\sw_command_ids.json`。⚠ 本机实测 SW2022 的类型库编号与注册表里的旧编号对不上，所以这台机器上翻不出名字——这是已知限制，不是 bug；中文名可以手动填 `data\sw_shortcut_map.json`。想提前生成可以运行 `python app\sw_shortcuts.py --generate data`。
 4. **对账是软提示**：`stream2_no_effect` 可能是纯视图操作（如点一下空白处），`stream1_orphan` 可能是外部程序改动——标出来供你判断，不自动删数据。
 5. **截图范围（2026-10-23 二次复验加固）**：只抓**触发时那一个 CAD 窗口自己的画面**——用 Windows `PrintWindow` 按窗口取图（`PrintWindow` 两次都失败时，最后退回用**该窗口的 DC** 做 BitBlt——仍然是"按窗口取画面"，不是屏幕），**不再整屏截图再裁剪**，也没有整屏兜底。抓取前复核目标窗口仍存活、仍在前台、**exe/title 与触发时一致**；抓取后再复核一次（窗口仍在/没被切走）。任何一次不通过就跳过并丢弃图片（不保存、不上传、不写识别结果）；窗口最小化/矩形无效在抓取前就拒绝（抓取函数都不会被调用）。

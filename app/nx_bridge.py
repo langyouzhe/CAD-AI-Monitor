@@ -13,6 +13,9 @@ nx_bridge.py —— 流1 NX 桥：跟踪 NX Journal（录制脚本）的菜单 /
    - 否则在 nx.journal_dirs（默认 桌面/文档/下载/data\\journals）里按 mtime
      找"内容像 journal"的最新文件（有内容特征过滤，不会乱捡 .py 脚本）。
 2. 挂上时先记住文件行数（旧内容不重放）；之后每秒重读，只发新增行。
+   v0.2.3：config 里 nx.replay_existing=true 时，"挂上/文件被截断后重挂"会把
+   已有行从头补读一次（补回"先录 journal、后点开始采集"的那段操作）；只在
+   挂上那一次补读，不是每轮轮询都补。默认 false = 旧行为。
 3. 解析成事件：
    - stream1/nx_session  {"event_type": "journal_attached", "journal_file": ...}
    - stream1/nx_journal  {"type": "menu"|"api", ...}
@@ -38,6 +41,9 @@ class NxBridge:
         #   <data_dir>\journals（见 collector_core.nx_journal_dir）
         self.data_dir = self.cfg.get("data_dir") or None
         self.poll_s = float(self.cfg.get("poll_interval_s", 1.0))
+        # v0.2.3：挂上 journal 时是否补读已有内容（默认关 = 旧行为）。
+        # 只决定"挂上/截断重挂"那一次要不要从头解析，不是每轮轮询都补读。
+        self.replay_existing = bool(self.cfg.get("replay_existing", False))
         self.on_event = on_event
         self.is_running = is_running
         self._thread = None
@@ -90,15 +96,35 @@ class NxBridge:
         return out
 
     def _attach(self, target: Path):
-        """挂上一个 journal：记住当前行数（旧内容不重放），回调通知。"""
+        """挂上一个 journal：记住当前行数（旧内容默认不重放），回调通知。
+
+        v0.2.3：`nx.replay_existing=true` 时，先把文件里已有的行从头解析、
+        按顺序回调（补回"先录 journal、后点开始采集"的那段操作），再把行数
+        记为当前行数——只在挂上/截断重挂时做这一次，之后轮询仍只发新增行。
+        """
         text = journal_parser.read_journal_text(target)
-        self._last_line_no = len(text.splitlines())
+        lines = text.splitlines()
+        # 先记住行数：即使补读时某个回调抛异常，也不会在下一轮重复补读同一批旧行
+        self._last_line_no = len(lines)
         self._current = str(target)
         with self._lock:
             self._state.update(connected=True, journal_file=str(target),
                                last_error=None)
         self.on_event("nx_session", {"event_type": "journal_attached",
                                      "journal_file": str(target)})
+        if self.replay_existing:
+            self._replay_lines(lines, target)
+
+    def _replay_lines(self, lines, target: Path):
+        """把已有 journal 行按顺序解析回调（只在 _attach 里调用，整份只补一次）。"""
+        for idx, line in enumerate(lines, 1):
+            ev = journal_parser.parse_journal_line(line)
+            if ev:
+                self.on_event("nx_journal", {
+                    "journal_file": target.name,
+                    "line_no": idx,
+                    **ev,
+                })
 
     def _poll_once(self):
         target = journal_parser.find_latest_journal(

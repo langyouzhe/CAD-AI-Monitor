@@ -6,10 +6,15 @@ journal_parser.py —— NX Journal（录制脚本）解析器（2026-10-23 新�
 建模操作；真正记录"点了哪个菜单"的是 NX 的「录制日志（Record Journal）」
 输出：.cs / .py / .vb 脚本。录制脚本里每条操作前都有注释行：
 
-    //   Menu: Insert->Design Feature->Extrude...
-    //   Menu: Insert->Curve->Rectangle...
+    //   Menu: Insert->Design Feature->Extrude...     （C#/.cs）
+    #    Menu: Insert->Curve->Rectangle...            （Python/.py）
+    '    Menu: Insert->Sketch...                      （VB/.vb）
 
 以及大量 NXOpen API 调用（例如 NXOpen.Features.FeatureCollection.CreateExtrude）。
+
+v0.2.3（2026-10-27）：MENU_RE 支持 //、#、' 三种注释前缀（行首可有空白），
+因为 NX 的 Python journal 用 "#   Menu:"、VB journal 用 "'   Menu:"；以前只认
+"// Menu:"，Python/VB 日志解析不到菜单。API_RE 不变。
 
 本模块只做**纯解析**：吃一个 journal 文件，吐出结构化事件。不依赖 NX、
 不依赖第三方库，可单独单测（tests/fixtures/journal_sample.cs）。
@@ -22,8 +27,10 @@ journal_parser.py —— NX Journal（录制脚本）解析器（2026-10-23 新�
 import re
 from pathlib import Path
 
-# "//   Menu: Insert->Design Feature->Extrude..."（// 与 Menu 之间空白任意）
-MENU_RE = re.compile(r"//\s*Menu:\s*(.+?)\s*$")
+# 行首可有空白；注释前缀支持 //（C#/.cs）、#（Python）、'（VB）三种：
+#   "//   Menu: Insert->..."、"#   Menu: ..."、"' Menu: ..."
+# 只认 "Menu:" 开头的注释行；其它注释（日志头、说明文字）不解析。
+MENU_RE = re.compile(r"^\s*(?://|#|')\s*Menu:\s*(.+?)\s*$")
 # NXOpen.xxx.yyy 里的类路径与最后一个方法名（只认大驼峰方法名，避开属性）
 API_RE = re.compile(r"\bNXOpen\.([A-Za-z0-9_.]+)\.([A-Z][A-Za-z0-9_]*)")
 # 判断"这文件像不像 journal"用的特征串（任中一个即可）

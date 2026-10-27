@@ -409,6 +409,36 @@ def test_creo_nx_parsers():
     shutil.rmtree(str(jtmp), ignore_errors=True)
     ok("NX journal 解析正确（menu/API/UTF-16与UTF-8/内容过滤）")
 
+    # ---- NX Python journal（v0.2.3）：'#   Menu:' 注释 + NXOpen 调用 ----
+    # 以前 MENU_RE 只认 "// Menu:"，NX 的 Python journal 用 "#   Menu:" 就一条
+    # 菜单也解析不到；这个 fixture 按真实 Python journal 的样子写（UTF-8）。
+    from journal_parser import looks_like_journal
+    fx_py = (Path(__file__).resolve().parent.parent / "tests" / "fixtures"
+             / "journal_sample.py")
+    assert fx_py.is_file(), f"缺少 Python journal 测试样本: {fx_py}"
+    assert looks_like_journal(fx_py) is True, "Python journal 样本应被识别为 journal"
+    py_parsed = parse_journal(fx_py)
+    py_menus = [e for e in py_parsed if e["type"] == "menu"]
+    py_apis = [e for e in py_parsed if e["type"] == "api"]
+    assert len(py_menus) == 3, f"Python journal 应有 3 条 menu，实际 {len(py_menus)}"
+    assert len(py_apis) == 2, f"Python journal 应有 2 条 api，实际 {len(py_apis)}"
+    assert [e["type"] for e in py_parsed] == ["menu", "menu", "menu", "api", "api"], \
+        f"Python journal 事件顺序/条数不对: {py_parsed}"
+    assert py_menus[0]["menu"] == "File->New..."
+    assert py_menus[-1]["menu"] == "Insert->Design Feature->Extrude..."
+    assert (py_apis[0]["class"], py_apis[0]["method"]) == ("Session", "GetSession")
+    assert (py_apis[1]["class"], py_apis[1]["method"]) == (
+        "Features.FeatureCollection", "CreateExtrude")
+    # 三种注释前缀（行首空白任意）都只认 "Menu:" 行；API_RE 行为不变
+    assert parse_journal_line("    #   Menu: Insert->Sketch")["menu"] == "Insert->Sketch"
+    assert parse_journal_line("'   Menu: Insert->Design Feature")["menu"] == "Insert->Design Feature"
+    assert parse_journal_line("// Menu: Insert->Curve->Line")["menu"] == "Insert->Curve->Line"
+    assert parse_journal_line("# Menu list: not a menu line") is None, \
+        "只匹配 'Menu:' 行，'# Menu list:' 不算"
+    assert parse_journal_line("NXOpen.Session.GetSession()") == {
+        "type": "api", "class": "Session", "method": "GetSession"}
+    ok("NX Python journal 解析正确（# Menu 注释 + NXOpen；VB 的 ' Menu 也认）")
+
 
 # ---------- 9. AI 眼（假模式）单元测试：时间戳对齐（确定性，不受真人输入干扰） ----------
 
@@ -2461,6 +2491,205 @@ def test_integration_scripts_only_close_owned():
        "生产脚本 connect_sw 返回自己 Popen 的 PID）")
 
 
+# ======================================================================
+# v0.2.3（2026-10-27）：NX 2406 实测准备
+# 补读开始采集前已录的 journal / 选 journal 写配置 / 实验性自动录制脚本
+# ======================================================================
+
+def _nx_journal_seed_lines():
+    """造一份"点开始采集前已经录好"的 journal：1 行文件头 + 3 条事件。"""
+    return ["// NX journal",
+            "// Menu: Insert->Sketch",
+            "NXOpen.Session.GetSession()",
+            "// Menu: Insert->Design Feature->Extrude..."]
+
+
+def test_nx_replay_existing_on():
+    """v0.2.3：`nx.replay_existing=true` → 挂上时把已录的 3 条事件按行序补读一次。"""
+    from nx_bridge import NxBridge
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-nxreplay-"))
+    journal = tmp / "j.cs"
+    journal.write_text("\n".join(_nx_journal_seed_lines()) + "\n", encoding="utf-8")
+    events = []
+    try:
+        bridge = NxBridge({"journal_path": str(journal), "replay_existing": True},
+                          lambda kind, detail: events.append((kind, detail)),
+                          lambda: True)
+        assert bridge.replay_existing is True
+        # 直接驱动一次轮询（= 挂上），不启动线程：测试不需要 sleep，完全确定性
+        bridge._poll_once()
+        assert any(k == "nx_session" for k, _ in events), events
+        replayed = [d for k, d in events if k == "nx_journal"]
+        assert len(replayed) == 3, f"应补读 3 条，实际 {len(replayed)}: {replayed}"
+        assert [d["type"] for d in replayed] == ["menu", "api", "menu"], replayed
+        assert [d["line_no"] for d in replayed] == [2, 3, 4], replayed
+        assert replayed[0]["menu"] == "Insert->Sketch"
+        assert replayed[-1]["menu"] == "Insert->Design Feature->Extrude..."
+        assert all(d["journal_file"] == "j.cs" for d in replayed)
+        assert bridge._last_line_no == 4
+        # 下一轮没有新行：绝不能把旧行再补一遍（只补一次）
+        bridge._poll_once()
+        assert len([d for k, d in events if k == "nx_journal"]) == 3, events
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("NX 补读正确（replay_existing=true：挂上即补回已有 3 条 menu/API，且只补一次）")
+
+
+def test_nx_replay_existing_off():
+    """v0.2.3：`nx.replay_existing=false`（默认）保持旧行为：已有内容不补读。"""
+    from nx_bridge import NxBridge
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-nxreplayoff-"))
+    journal = tmp / "j.cs"
+    journal.write_text("\n".join(_nx_journal_seed_lines()) + "\n", encoding="utf-8")
+    events = []
+    try:
+        # 故意不传 replay_existing → 默认值必须和 DEFAULT_CONFIG 一致（false）
+        bridge = NxBridge({"journal_path": str(journal)},
+                          lambda kind, detail: events.append((kind, detail)),
+                          lambda: True)
+        assert bridge.replay_existing is False
+        assert DEFAULT_CONFIG["nx"]["replay_existing"] is False
+        # config.example.json 也必须同步（用户照它改配置）
+        example = json.loads((Path(__file__).resolve().parent.parent
+                              / "config.example.json").read_text(encoding="utf-8"))
+        assert example["nx"]["replay_existing"] is False, example["nx"]
+        bridge._poll_once()
+        assert any(k == "nx_session" for k, _ in events), events
+        assert [d for k, d in events if k == "nx_journal"] == [], events
+        assert bridge._last_line_no == 4, "旧行为也要记住当前行数（之后只发新增）"
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("NX 补读默认关闭（replay_existing=false：挂上不重放旧内容，与旧版行为一致）")
+
+
+def test_nx_replay_append_only_new():
+    """v0.2.3：补读之后再追加 → 每轮只发新增 1 条，不重复补读旧行。"""
+    from nx_bridge import NxBridge
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-nxappend-"))
+    journal = tmp / "j.cs"
+    journal.write_text("\n".join(_nx_journal_seed_lines()) + "\n", encoding="utf-8")
+    events = []
+    try:
+        bridge = NxBridge({"journal_path": str(journal), "replay_existing": True},
+                          lambda kind, detail: events.append((kind, detail)),
+                          lambda: True)
+        bridge._poll_once()
+        assert len([d for k, d in events if k == "nx_journal"]) == 3
+        with open(str(journal), "a", encoding="utf-8") as f:
+            f.write("// Menu: File->Save\n")
+        bridge._poll_once()
+        got = [d for k, d in events if k == "nx_journal"]
+        assert len(got) == 4, f"补读 3 条 + 新增 1 条，实际 {len(got)}: {got}"
+        assert got[-1]["menu"] == "File->Save"
+        assert got[-1]["line_no"] == 5, got[-1]
+        assert bridge._last_line_no == 5
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("NX 补读后追加正确（只发新增 1 条，不重复补读已有内容）")
+
+
+def test_nx_replay_truncate_reattach():
+    """v0.2.3：journal 被截断重挂 → 不重复发旧行；之后追加只发新的。"""
+    from nx_bridge import NxBridge
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-nxtrunc-"))
+    journal = tmp / "j.cs"
+    journal.write_text("\n".join(_nx_journal_seed_lines()) + "\n", encoding="utf-8")
+    events = []
+    try:
+        bridge = NxBridge({"journal_path": str(journal), "replay_existing": True},
+                          lambda kind, detail: events.append((kind, detail)),
+                          lambda: True)
+        bridge._poll_once()
+        assert len([d for k, d in events if k == "nx_journal"]) == 3
+        # 文件被截断/重写成只剩文件头（0 条事件）：重挂时按"当前文件内容"补读，
+        # 已经发过的旧行不会再发一遍。
+        journal.write_text("// NX journal\n", encoding="utf-8")
+        bridge._poll_once()
+        assert len([d for k, d in events if k == "nx_journal"]) == 3, \
+            "截断重挂不能重复发送旧行"
+        assert bridge._last_line_no == 1
+        # 截断后追加的新操作照常只发新增
+        with open(str(journal), "a", encoding="utf-8") as f:
+            f.write("// Menu: Insert->Revolve\n")
+        bridge._poll_once()
+        got = [d for k, d in events if k == "nx_journal"]
+        assert len(got) == 4, got
+        assert got[-1]["menu"] == "Insert->Revolve" and got[-1]["line_no"] == 2, got[-1]
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("NX 截断重挂正确（不重复发旧行；之后的新增照常只发 1 条）")
+
+
+def test_nx_autorecord_script():
+    """v0.2.3：实验性自动录制脚本写到 <data_dir>\\nx\\，内容含数据目录与 RecordJournal。"""
+    from collector_core import (nx_autorecord_script_path, nx_autorecord_script_text,
+                                write_nx_autorecord_script)
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-nxauto-"))
+    when = datetime(2026, 10, 27, 12, 34, 56)
+    try:
+        path = write_nx_autorecord_script(tmp, when=when)
+        assert path.is_file(), f"脚本文件应真的创建: {path}"
+        assert path == tmp / "nx" / "autorecord_startup.py", path
+        assert path == nx_autorecord_script_path(tmp)
+        text = path.read_text(encoding="utf-8")
+        assert "import NXOpen" in text, text
+        assert "Session.GetSession().JournalManager.RecordJournal(" in text, text
+        assert str(tmp) in text, "脚本内容必须包含本次数据目录"
+        expected_journal = tmp / "journals" / "nx_20261027_123456.cs"
+        assert str(expected_journal) in text, \
+            f"录制目标应是 <data_dir>\\journals\\nx_<时间戳>.cs: {expected_journal}"
+        assert "try:" in text and "except Exception" in text, "录制调用必须用 try/except 包住"
+        # 纯函数与写盘内容一致；重复生成覆盖同名文件（幂等，不建第二个脚本）
+        assert nx_autorecord_script_text(tmp, when=when) == text
+        assert write_nx_autorecord_script(tmp, when=when) == path
+        assert len(list((tmp / "nx").glob("autorecord_startup.py"))) == 1
+    finally:
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("NX 实验自动录制脚本生成正确（写到 <data_dir>\\nx\\autorecord_startup.py，"
+       "内容含数据目录 + RecordJournal + try/except）")
+
+
+def test_nx_journal_path_setting():
+    """v0.2.3：【选择 NX journal 文件】只改 nx.journal_path，保留其它键，密钥不落盘。"""
+    from collector_core import ConfigManager, set_nx_journal_path
+    tmp = Path(tempfile.mkdtemp(prefix="cad-ai-nxpick-"))
+    old_env = os.environ.get("AI_EYE_KEY")
+    try:
+        mgr = ConfigManager(tmp)
+        cfg = mgr.load()
+        cfg["idle_minutes"] = 8.5                     # 用户改过的设置
+        cfg.setdefault("nx", {})["journal_dirs"] = ["D:\\my_journals"]
+        mgr.save(cfg)
+        journal = tmp / "my_journal.py"
+        journal.write_text("# Menu: File->New\n", encoding="utf-8")
+        os.environ["AI_EYE_KEY"] = "sk-test-must-not-land-on-disk"
+        merged = set_nx_journal_path(tmp, journal)
+        assert merged["nx"]["journal_path"] == str(journal)
+        saved = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+        assert saved["nx"]["journal_path"] == str(journal), saved.get("nx")
+        assert saved["idle_minutes"] == 8.5, "选择文件不能覆盖其它设置"
+        assert saved["nx"]["journal_dirs"] == ["D:\\my_journals"], saved["nx"]
+        assert saved["ai_eye"]["api_key"] == "", "环境变量 AI_EYE_KEY 绝不能落盘"
+        assert "sk-test-must-not-land-on-disk" not in json.dumps(saved)
+        # 再选另一个文件：覆盖同一个键；传空字符串 = 清空回自动发现
+        journal2 = tmp / "j2.cs"
+        journal2.write_text("// Menu: File->Open\n", encoding="utf-8")
+        set_nx_journal_path(tmp, str(journal2))
+        saved2 = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+        assert saved2["nx"]["journal_path"] == str(journal2), saved2["nx"]
+        assert saved2["idle_minutes"] == 8.5
+        set_nx_journal_path(tmp, "")
+        saved3 = json.loads((tmp / "config.json").read_text(encoding="utf-8"))
+        assert saved3["nx"]["journal_path"] == "", saved3["nx"]
+    finally:
+        if old_env is None:
+            os.environ.pop("AI_EYE_KEY", None)
+        else:
+            os.environ["AI_EYE_KEY"] = old_env
+        shutil.rmtree(str(tmp), ignore_errors=True)
+    ok("选择 NX journal 保存正确（只改 nx.journal_path / 保留其它键 / 环境密钥不落盘）")
+
+
 # CI 上能跑的"确定性"子集：不装钩子、不注入输入、不截图、不依赖本机装了哪家 CAD。
 # 用法：python app\selftest.py --ci   （GitHub Actions 就是这么跑的）
 CI_SAFE_TESTS = [
@@ -2480,6 +2709,13 @@ CI_SAFE_TESTS = [
     test_invalid_capture_box_fails_selftest,
     test_config_env_key_not_persisted,
     test_nx_journal_dir_same_source,
+    # v0.2.3：NX 2406 实测准备（纯文件/纯逻辑，不碰 tkinter/屏幕/真 NX）
+    test_nx_replay_existing_on,
+    test_nx_replay_existing_off,
+    test_nx_replay_append_only_new,
+    test_nx_replay_truncate_reattach,
+    test_nx_autorecord_script,
+    test_nx_journal_path_setting,
     test_sw_com_disconnect_reconnect,
     test_sw_feature_traversal_error_disconnects,
     test_integration_scripts_only_close_owned,
@@ -2522,6 +2758,13 @@ if __name__ == "__main__":
     test_config_env_key_not_persisted()
     test_nx_journal_dir_same_source()
     test_nx_bridge_data_dir_wired()
+    # v0.2.3：NX 2406 实测准备（补读已有 journal / 选文件 / 实验自动录制脚本）
+    test_nx_replay_existing_on()
+    test_nx_replay_existing_off()
+    test_nx_replay_append_only_new()
+    test_nx_replay_truncate_reattach()
+    test_nx_autorecord_script()
+    test_nx_journal_path_setting()
     test_write_failure_keeps_session()
     test_sw_com_disconnect_reconnect()
     test_sw_feature_traversal_error_disconnects()
